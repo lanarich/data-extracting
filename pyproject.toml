@@ -13,6 +13,9 @@ chonkie = {extras = ["all"], version = "^1.0.5"}
 aiogram = "^3.20.0.post0"
 sqlalchemy = "^2.0.40"
 asyncpg = "^0.30.0"
+deepeval = "^2.7.9"
+chromadb = "^1.0.7"
+pypdf = "^5.4.0"
 
 
 [tool.poetry.group.dev.dependencies]
