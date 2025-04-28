@@ -1,0 +1,437 @@
+TITLE: Generating Embeddings for Chunks (Python)
+DESCRIPTION: This code snippet generates embeddings for each text chunk using the model2vec model. It extracts the text from each chunk, encodes it using the model, and prints the shape of the resulting vectors. Depends on the model being initialized earlier and the chunks being available.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_9
+
+LANGUAGE: python
+CODE:
+```
+items = [chunk.text for chunk in chunks]
+vectors = model.encode(items)
+print(vectors.shape)
+```
+
+----------------------------------------
+
+TITLE: Defining Embedding Retrieval Function (Python)
+DESCRIPTION: This code snippet defines a function get_embeddings that retrieves relevant embeddings for a given query. It encodes the query using the model, queries the vicinity index for the top k (k=4 in this case) most similar chunks, and returns a list of those retrieved chunks.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_11
+
+LANGUAGE: python
+CODE:
+```
+def get_embeddings(query: str):
+  query_vector = model.encode(query)
+  results = vicinity.query(query_vector, k=4)
+  return [x[0] for x in results[0]]
+```
+
+----------------------------------------
+
+TITLE: Creating Vicinity Index from Vectors and Items (Python)
+DESCRIPTION: This code snippet creates a Vicinity index from the generated vectors and the corresponding items (chunks). It initializes a Vicinity instance using the basic backend and cosine metric. The Vicinity instance facilitates efficient similarity searches.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_10
+
+LANGUAGE: python
+CODE:
+```
+# Initialize the Vicinity instance (using basic backend and cosine metric)
+vicinity = Vicinity.from_vectors_and_items(
+    vectors=vectors,
+    items=items,
+    backend_type=Backend.BASIC,
+    metric=Metric.COSINE
+)
+```
+
+----------------------------------------
+
+TITLE: Creating LLM Prompt with Retrieved Chunks (Python)
+DESCRIPTION: This code snippet defines a function `create_prompt` that creates a prompt for the LLM using the retrieved chunks and the user query.  It formats the chunks into a context section with document labels, and the query into a query section.  It uses a prompt template to combine these elements.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_12
+
+LANGUAGE: python
+CODE:
+```
+# A simple function to make LLM prompts with chunks
+def create_prompt(chunks: List[str], query: str) -> str:
+  prompt_template = """<instructions>
+  Based on the provided contexts, answer the given question to the best of your ability. Remember to also add citations at appropriate points in the format of square brackets like [1][2][3], especially at sentence or paragraph endings.
+  You will be given 4 passages in the context, marked with a label 'Doc [1]:' to denote the passage number. Use that number for citations. Answer only from the given context, and if there's no appropriate context, reply "No relevant context found!".
+  </instructions>
+
+  <context>
+  {context}
+  </context>
+
+  <query>
+  {query}
+  </query>
+  """
+  context = "\n\n".join([f"Doc {i+1}: {chunk}" for i, chunk in enumerate(chunks)])
+  prompt = prompt_template.format(context=context, query=query)
+  return prompt
+```
+
+----------------------------------------
+
+TITLE: Generating LLM Response with Together AI (Python)
+DESCRIPTION: This code snippet generates a response from the DeepSeek R1 model using the Together AI client. It creates a chat completion request with the generated prompt and then extracts the answer from the response. It removes the thinking tokens to only show the final response.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_13
+
+LANGUAGE: python
+CODE:
+```
+response = client.chat.completions.create(
+    model="deepseek-ai/DeepSeek-R1",
+    messages=[{"role": "user", "content": prompt}],
+)
+# Print the final response without the thinking tokens
+answer = response.choices[0].message.content.split("</think>")[-1]
+rprint(answer)
+```
+
+----------------------------------------
+
+TITLE: Initializing RecursiveChunker with Rules (Python)
+DESCRIPTION: This code snippet initializes a RecursiveChunker with custom RecursiveRules for markdown chunking. It defines rules with multiple levels of delimiters to help Chonkie understand the markdown syntax. The chunk_size is set to 384.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_7
+
+LANGUAGE: python
+CODE:
+```
+rules = RecursiveRules(
+    levels=[
+        RecursiveLevel(delimiters=['######', '#####', '####', '###', '##', '#']),
+        RecursiveLevel(delimiters=['\n\n', '\n', '\r\n', '\r']),
+        RecursiveLevel(delimiters=['.?!;:']),
+        RecursiveLevel()
+    ]
+)
+chunker = RecursiveChunker(rules=rules, chunk_size=384)
+```
+
+----------------------------------------
+
+TITLE: Chunking Text with RecursiveChunker (Python)
+DESCRIPTION: This code snippet chunks the input text using the initialized RecursiveChunker. It calls the chunker with the text and then prints the total number of chunks generated. It depends on the chunker and rules being initialized beforehand.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_8
+
+LANGUAGE: python
+CODE:
+```
+# This is all it takes to chunk!
+chunks = chunker(text)
+print(f"Total number of chunks: {len(chunks)}")
+```
+
+----------------------------------------
+
+TITLE: Initializing Model and API Key (Python)
+DESCRIPTION: This code snippet initializes the necessary components for interacting with the Together AI's DeepSeek R1 model. It sets the Together API key from Google Colab userdata, initializes a model2vec model for generating embeddings, initializes the Together client for calling the LLM, and initializes the tokenizer for DeepSeek R1 to count tokens.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_3
+
+LANGUAGE: python
+CODE:
+```
+# Set your Together API key to use Deepseek R1 with it~
+os.environ['TOGETHER_API_KEY'] = userdata.get('TOGETHER_API_KEY')
+
+# Initialise a model2vec model for encoding sentences for retrieval
+model = StaticModel.from_pretrained("minishlab/potion-retrieval-32M")
+
+# Initialise the Together client to call upon Deepseek R1
+client = Together()
+
+# (Optional) Initialise the tokenizer for Deepseek R1
+# We use this to get token counts at various points in this colab.
+tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/DeepSeek-R1")
+```
+
+----------------------------------------
+
+TITLE: Installing Chonkie and Dependencies (Python)
+DESCRIPTION: This code snippet installs the necessary Python packages, including chonkie, docling, model2vec, vicinity, together, and rich, using pip. It prepares the environment for the subsequent steps in the notebook, such as converting PDFs to Markdown, chunking, creating embeddings, and building the RAG application.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_0
+
+LANGUAGE: python
+CODE:
+```
+!pip install -q chonkie docling model2vec vicinity together rich[jupyter]
+```
+
+----------------------------------------
+
+TITLE: Basic Chonkie Usage Example
+DESCRIPTION: This example demonstrates the basic usage of the Chonkie library. It imports the `RecursiveChunker`, initializes it, chunks a sample text, and prints the text and token count of each chunk. This provides a quick start for understanding how to use Chonkie for text chunking.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/README.md#_snippet_2
+
+LANGUAGE: python
+CODE:
+```
+# First import the chunker you want from Chonkie
+from chonkie import RecursiveChunker
+
+# Initialize the chunker
+chunker = RecursiveChunker()
+
+# Chunk some text
+chunks = chunker("Chonkie is the goodest boi! My favorite chunking hippo hehe.")
+
+# Access chunks
+for chunk in chunks:
+    print(f"Chunk: {chunk.text}")
+    print(f"Tokens: {chunk.token_count}")
+```
+
+----------------------------------------
+
+TITLE: Counting Tokens in PDF Text (Python)
+DESCRIPTION: This code snippet calculates the total number of tokens in the PDF text using the tokenizer.encode method from the transformers library. It prints the token count to the console using the rprint function, indicating the size of the PDF document in tokens.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_6
+
+LANGUAGE: python
+CODE:
+```
+total_text_tokens = len(tokenizer.encode(text))
+rprint(f"This PDF contains: {total_text_tokens} tokens")
+```
+
+----------------------------------------
+
+TITLE: Counting Tokens in Prompt (Python)
+DESCRIPTION: This code snippet counts the number of tokens present in the generated LLM prompt using the tokenizer's encode method. It prints the token count to the console, providing insight into the size of the prompt sent to the LLM.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_14
+
+LANGUAGE: python
+CODE:
+```
+prompt_tokens = len(tokenizer.encode(prompt))
+rprint(f"This prompt contains: {prompt_tokens} tokens")
+```
+
+----------------------------------------
+
+TITLE: Importing Libraries (Python)
+DESCRIPTION: This code snippet imports the required libraries for using Chonkie, docling, model2vec, vicinity, together, rich, transformers and other utilities. It sets up the environment for the various functionalities used in the notebook, such as chunking, document conversion, embedding generation, and interacting with LLMs.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_1
+
+LANGUAGE: python
+CODE:
+```
+from chonkie import RecursiveChunker, RecursiveRules, RecursiveLevel
+from docling.document_converter import DocumentConverter
+from google.colab import userdata
+from model2vec import StaticModel
+import numpy as np
+import os
+from pprint import pprint
+from rich.console import Console
+from rich.text import Text
+from together import Together
+from transformers import AutoTokenizer
+from typing import List
+from vicinity import Vicinity, Backend, Metric
+```
+
+----------------------------------------
+
+TITLE: Converting PDF to Markdown with Docling (Python)
+DESCRIPTION: This code snippet uses the docling library to convert a PDF document from a given URL to Markdown format. It initializes a DocumentConverter, converts the PDF from the source URL, and extracts the markdown text from the resulting document object. Requires the `docling` package to be installed.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_4
+
+LANGUAGE: python
+CODE:
+```
+# Docling can convert any PDF to markdown!
+converter = DocumentConverter()
+source = "https://arxiv.org/pdf/1706.03762"
+result = converter.convert(source)
+text = result.document.export_to_markdown()
+```
+
+----------------------------------------
+
+TITLE: Installing Chonkie with pip
+DESCRIPTION: This command demonstrates how to install the Chonkie library using pip, the Python package installer. It installs the base package with minimal dependencies. This is the recommended installation method for most users.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/README.md#_snippet_0
+
+LANGUAGE: bash
+CODE:
+```
+pip install chonkie
+```
+
+----------------------------------------
+
+TITLE: Development Setup
+DESCRIPTION: This snippet guides contributors on setting up their local development environment for the Chonkie project. It includes cloning the repository, creating a virtual environment, and installing the necessary dependencies using pip.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_0
+
+LANGUAGE: bash
+CODE:
+```
+# 1. Fork and clone the repository
+git clone https://github.com/your-username/chonkie.git
+cd chonkie
+
+# 2. Create a virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# 3. Install dependencies (choose one)
+pip install -e ".[dev]"                # Base development setup
+pip install -e ".[dev,semantic]"       # If working on semantic features
+pip install -e ".[dev,all]"            # For all features
+```
+
+----------------------------------------
+
+TITLE: Running Tests
+DESCRIPTION: This snippet demonstrates how to run tests for the Chonkie project using pytest. It includes commands for running all tests, running specific test files, and running tests with coverage reporting.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_1
+
+LANGUAGE: bash
+CODE:
+```
+pytest                           # Run all tests
+pytest tests/test_token_chunker.py    # Run specific test file
+pytest --cov=chonkie            # Run tests with coverage
+```
+
+----------------------------------------
+
+TITLE: Installing Chonkie with all optional dependencies
+DESCRIPTION: This command demonstrates how to install the Chonkie library with all optional dependencies using pip. This includes dependencies for all supported chunkers, tokenizers, and embedding models. Note that this is not recommended for production environments due to the increased size and potential for conflicts.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/README.md#_snippet_1
+
+LANGUAGE: bash
+CODE:
+```
+pip install chonkie[all]
+```
+
+----------------------------------------
+
+TITLE: Code Style Check
+DESCRIPTION: This snippet illustrates how to use ruff to check and automatically fix code style issues in the Chonkie project. It enforces code formatting, import sorting, documentation style, and docstring coverage.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_2
+
+LANGUAGE: bash
+CODE:
+```
+ruff check .                     # Check code quality
+ruff check --fix .               # Auto-fix issues where possible
+```
+
+----------------------------------------
+
+TITLE: Docstring Example
+DESCRIPTION: This code snippet demonstrates the Google-style docstring format used in the Chonkie project.  It shows how to document function arguments, return values, and exceptions.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_3
+
+LANGUAGE: python
+CODE:
+```
+def chunk_text(text: str, chunk_size: int = 512) -> List[str]:
+    """Split text into chunks of specified size.
+
+    Args:
+        text: Input text to chunk
+        chunk_size: Maximum size of each chunk
+
+    Returns:
+        List of text chunks
+
+    Raises:
+        ValueError: If chunk_size <= 0
+    """
+    pass
+```
+
+----------------------------------------
+
+TITLE: Initializing Rich Console and rprint Function (Python)
+DESCRIPTION: This code snippet initializes a Rich Console object and defines a utility function `rprint` for pretty printing text with word wrapping. It enhances the notebook's readability by providing a formatted output for text displayed to the user.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_2
+
+LANGUAGE: python
+CODE:
+```
+# Rich text console for better printing
+console = Console()
+
+# A wrapper to pretty print
+def rprint(text: str, console: Console=console, width: int = 80) -> None:
+  richtext = Text(text)
+  console.print(richtext.wrap(console, width=width))
+```
+
+----------------------------------------
+
+TITLE: Displaying Text Copy Button (Python)
+DESCRIPTION: Creates a button that, when clicked, copies the contents of the `text` variable to the clipboard using JavaScript. Uses IPython.display.HTML to inject HTML into the notebook output.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/cookbook/tutorials/Chonkie_RecursiveChunker_for_PDF_and_Markdown.ipynb#_snippet_5
+
+LANGUAGE: python
+CODE:
+```
+from IPython.display import HTML
+HTML(f"<button onclick=navigator.clipboard.writeText('{text}')>Copy</button>")
+```
+
+----------------------------------------
+
+TITLE: Development Dependencies
+DESCRIPTION: This snippet defines the development dependencies for the Chonkie project using the TOML format. It specifies the required versions for tools like tiktoken, datasets, transformers, pytest, coverage, ruff, and mypy.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_5
+
+LANGUAGE: toml
+CODE:
+```
+[project.optional-dependencies]
+dev = [
+    "tiktoken>=0.5.0",
+    "datasets>=1.14.0",
+    "transformers>=4.0.0",
+    "pytest>=6.2.0",
+    "pytest-cov>=4.0.0",
+    "pytest-xdist>=2.5.0",
+    "coverage",
+    "ruff>=0.0.265",
+    "mypy>=1.11.0"
+]
+```
+
+----------------------------------------
+
+TITLE: Commit Message Example
+DESCRIPTION: This snippet provides an example of a well-formatted commit message for the Chonkie project, including a brief description of the changes and a list of specific updates.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/CONTRIBUTING.md#_snippet_4
+
+LANGUAGE: text
+CODE:
+```
+feat: add batch processing to WordChunker
+
+- Implement batch_process method
+- Add tests for batch processing
+- Update documentation
+```
+
+----------------------------------------
+
+TITLE: Citation for Chonkie Library
+DESCRIPTION: This snippet provides the BibTeX entry for citing the Chonkie library in academic publications. It includes the authors, title, year, publisher, and URL of the GitHub repository. Using this citation helps give credit to the library's developers and maintainers.
+SOURCE: https://github.com/chonkie-inc/chonkie/blob/main/README.md#_snippet_3
+
+LANGUAGE: bibtex
+CODE:
+```
+@software{chonkie2025,
+  author = {Minhas, Bhavnick AND Nigam, Shreyash},
+  title = {Chonkie: A no-nonsense fast, lightweight, and efficient text chunking library},
+  year = {2025},
+  publisher = {GitHub},
+  howpublished = {\url{https://github.com/chonkie-inc/chonkie}},
+}
+```
