@@ -1,1 +1,0 @@
-{"api_key": "TNr/sGJqLmJ5Se2mVeDDynHcWob6rIraG1kBLrmcGCc=", "LOCAL_MODEL_NAME": "deepcogito/cogito-v1-preview-llama-8B", "LOCAL_MODEL_BASE_URL": "http://http://85.143.167.11:30000/v1/", "LOCAL_MODEL_API_KEY": "123", "LOCAL_MODEL_FORMAT": "json", "USE_LOCAL_MODEL": "YES", "USE_AZURE_OPENAI": "NO"}
