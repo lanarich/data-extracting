@@ -174,3 +174,4 @@ cython_debug/
 .pypirc
 /documentation
 .deepeval
+.infinity_cache
