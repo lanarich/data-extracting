@@ -175,3 +175,7 @@ cython_debug/
 /documentation
 .deepeval
 .infinity_cache
+/logs
+/postgres_data_on_host
+/.qdrant_storage
+/lightrag_data_docker
