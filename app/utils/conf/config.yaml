@@ -1,0 +1,47 @@
+defaults:
+  - server: server
+  - _self_
+
+logging:
+  console_level: "INFO"
+  file_path: "logs/bot_log_{time:YYYY-MM-DD}.log"
+  file_level: "INFO"
+  rotation: "100 MB"
+  retention: "10 days"
+  compression: "zip"
+
+application:
+  name: "Medical University Bot"
+  version: "0.1.0"
+  admin_ids:
+    - 6848724751
+
+llm:
+  api_base: "http://85.143.167.11:30000/v1"
+  model_name: "Qwen/Qwen3-8B"
+  api_key: "NO"
+  default_temperature: 0.7
+  default_max_tokens: 2048
+
+embedding:
+  model_name: "sergeyzh/BERTA"
+  api_base: "http://85.143.167.11:7997"
+  api_key: "NO"
+  dim: 768
+  max_input_tokens: 8000
+
+qdrant:
+  url: "http://85.143.167.11:6333"
+  cosine_better_than_threshold: 0.2
+
+rag_settings:
+  working_dir: "app/./lightrag_storage"
+  chunk_token_size: 512
+  chunk_overlap_token_size: 75
+  tiktoken_model_name: "o3"
+  llm_model_max_async: 300
+  max_parallel_insert: 10
+  enable_llm_cache: true
+  addon_params:
+    language: "Русский"
+    insert_batch_size: 20

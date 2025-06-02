@@ -1,0 +1,7 @@
+API_KEY: 7843154539:AAEKJ112EiYPW4rUCChASROgNebQZXOheHM
+DB_NAME: medical_bot_db
+DB_USER: admin
+DB_PASSWORD: password
+DB_HOST: 85.143.167.11
+DB_PORT: 5432
+TEXTS: app/core/texts.yaml
