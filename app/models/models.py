@@ -1,6 +1,6 @@
 import datetime
 
-from sqlalchemy import (  # Добавлен Boolean
+from sqlalchemy import (
     BigInteger,
     Boolean,
     Column,
@@ -16,7 +16,6 @@ Base = declarative_base()
 
 
 class TimestampMixin:
-    """Миксин для добавления временных меток created_at и updated_at."""
 
     created_at = Column(
         DateTime,
@@ -99,4 +98,4 @@ class Document(Base, TimestampMixin):
 
 
 Index("idx_document_status_uploaded_by", Document.status, Document.uploaded_by_tg_id)
-Index("idx_user_is_admin", User.is_admin)  # Индекс для нового поля
+Index("idx_user_is_admin", User.is_admin) 
