@@ -17,7 +17,7 @@ application:
     - 6848724751
 
 llm:
-  api_base: "http://85.143.167.11:30000/v1"
+  api_base: "http://127.0.0.1:30000/v1"
   model_name: "Qwen/Qwen3-8B"
   api_key: "NO"
   default_temperature: 0.7
@@ -25,13 +25,13 @@ llm:
 
 embedding:
   model_name: "sergeyzh/BERTA"
-  api_base: "http://85.143.167.11:7997"
+  api_base: "http://127.0.0.1:7997"
   api_key: "NO"
   dim: 768
   max_input_tokens: 8000
 
 qdrant:
-  url: "http://85.143.167.11:6333"
+  url: "http://127.0.0.1:6333"
   cosine_better_than_threshold: 0.2
 
 rag_settings:

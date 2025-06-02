@@ -7,6 +7,7 @@ from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.llm.openai import openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc
 from loguru import logger
+from utils.prompt import PROMPTS
 
 
 class RAGServiceError(Exception):
@@ -242,7 +243,9 @@ async def get_rag_answer(
         )
 
         logger.debug(f"Запрос к RAG: query='{query_text}', params={params}")
-        response_object = await rag_instance.aquery(query_text, param=params)
+        response_object = await rag_instance.aquery(
+            query_text, param=params, system_prompt=PROMPTS["rag_response"]
+        )
 
         answer = "Не удалось извлечь ответ из объекта RAG."
         if hasattr(response_object, "answer") and response_object.answer is not None:

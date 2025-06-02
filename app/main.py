@@ -52,7 +52,7 @@ except Exception as e:
     sys.exit("Загрузка конфигурации не удалась. Проверьте логи и настройки Hydra.")
 
 
-os.environ["QDRANT_URL"] = cfg.qdrant.get("url", "http://85.143.167.11:6333")
+os.environ["QDRANT_URL"] = cfg.qdrant.get("url", "http://127.0.0.1:6333")
 
 logger.remove()
 
