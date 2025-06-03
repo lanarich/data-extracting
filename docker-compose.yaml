@@ -103,4 +103,4 @@ services:
     network_mode: "host"
     volumes:
       - ./logs:/app/logs
-      - ./lightrag_data_docker:/app/lightrag_storage
+      - ./lightrag_data_docker:/app/app/lightrag_storage

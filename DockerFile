@@ -21,6 +21,5 @@ COPY ./app ./app
 
 
 RUN mkdir -p /app/logs
-RUN mkdir -p /app/lightrag_storage
 
 CMD ["python", "app/main.py"]
