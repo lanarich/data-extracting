@@ -1,3 +1,4 @@
+import asyncio  # Добавлено для фоновых задач
 import uuid
 from typing import Dict, List, Optional, Union
 
@@ -20,38 +21,44 @@ from keyboards.admin_kb import (
     get_confirm_delete_document_keyboard,
     get_documents_list_keyboard,
 )
+from langfuse import Langfuse
+
+# Langfuse imports, если langfuse_handler передается
+from langfuse.callback import (
+    CallbackHandler as LangfuseCallbackHandler,  # Переименовано во избежание конфликта
+)
 from lightrag import LightRAG
 from loguru import logger
-from models.models import Document as DB_Document
-from services.db_service import add_document as db_add_document
+from models.models import Document as DB_Document  # Оставляем для типизации, если нужно
+from omegaconf import DictConfig  # Для доступа к cfg
+from services.db_service import add_document as db_add_document  # Уже асинхронный
+from services.db_service import mark_document_as_deleted_by_admin  # Уже асинхронный
+from services.db_service import update_document_status  # Уже асинхронный
 from services.db_service import (
     get_document_by_lightrag_id,
     get_documents_for_admin_list,
     get_session,
     get_user_by_id,
-    mark_document_as_deleted_by_admin,
-    update_document_status,
 )
-from services.document_service import (
-    DocumentParsingError,
-    cleanup_temp_file,
-    parse_document_to_markdown,
-    save_uploaded_file_temp,
+from services.document_service import parse_document_to_markdown  # Уже асинхронный
+from services.document_service import save_uploaded_file_temp  # Уже асинхронный
+from services.document_service import DocumentParsingError, cleanup_temp_file
+from services.rag_service import (  # Уже асинхронный
+    RAGServiceError,
+    add_document_contents_to_rag,
 )
-from services.rag_service import RAGServiceError, add_document_contents_to_rag
-from services.rag_service import delete_document_from_rag as rag_delete_document
-from services.rag_service import get_multiple_document_statuses_from_rag
+from services.rag_service import (
+    delete_document_from_rag as rag_delete_document,  # Уже асинхронный
+)
+from services.rag_service import (  # Уже асинхронный
+    get_multiple_document_statuses_from_rag,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 DOCS_PER_PAGE = 5
 
 
 class AdminFilter(Filter):
-    """
-    Фильтр для проверки, является ли пользователь администратором,
-    проверяя поле is_admin в базе данных.
-    """
-
     async def __call__(
         self,
         message_or_call: Union[Message, CallbackQuery],
@@ -68,7 +75,7 @@ class AdminFilter(Filter):
                     return True
                 else:
                     logger.debug(
-                        f"Пользователь {user_id} не является администратором (is_admin=False или не найден в БД). Доступ запрещен."
+                        f"Пользователь {user_id} не является администратором. Доступ запрещен."
                     )
                     return False
         except Exception as e:
@@ -88,18 +95,188 @@ admin_router.message.filter(AdminFilter())
 admin_router.callback_query.filter(AdminFilter())
 
 
+async def _process_document_background(
+    bot: Bot,  # Добавлен bot для возможной отправки уведомлений
+    chat_id: int,  # Добавлен chat_id для возможной отправки уведомлений
+    user_id: int,  # Добавлен user_id для логирования и связи с БД
+    temp_file_path: str,
+    original_file_name: str,
+    lightrag_doc_id: str,
+    session_pool: async_sessionmaker[AsyncSession],
+    rag_instance: LightRAG,
+    bot_texts: dict,
+    cfg: DictConfig,  # Добавлена конфигурация Hydra
+    langfuse_handler: Optional[
+        LangfuseCallbackHandler
+    ] = None,  # Опциональный Langfuse handler
+):
+    """Фоновая задача для обработки документа."""
+    langfuse_trace = None
+    if cfg.langfuse.enabled:
+        try:
+            # Инициализируем Langfuse клиента здесь, если он не был передан
+            # Или используем глобальный/переданный клиент
+            # Для простоты, предположим, что cfg содержит все необходимое для инициализации
+            langfuse_client = Langfuse(
+                public_key=cfg.langfuse.public_key,
+                secret_key=cfg.langfuse.secret_key,
+                host=cfg.langfuse.host,
+                release=cfg.langfuse.get("release"),
+                debug=cfg.langfuse.get("debug", False),
+            )
+            langfuse_trace = langfuse_client.trace(
+                name="document-processing-pipeline",
+                user_id=str(user_id),  # Langfuse ожидает user_id как строку
+                metadata={
+                    "file_name": original_file_name,
+                    "lightrag_doc_id": lightrag_doc_id,
+                    "trigger": "admin_upload",
+                },
+            )
+            logger.info(
+                f"[Langfuse] Трейс создан для обработки документа: {lightrag_doc_id}"
+            )
+        except Exception as e_fuse:
+            logger.error(f"Ошибка инициализации Langfuse в фоновой задаче: {e_fuse}")
+            # Продолжаем без Langfuse, если инициализация не удалась
+
+    db_doc_created = False
+    processing_status = "unknown_error"  # Статус по умолчанию
+
+    try:
+        logger.info(
+            f"Фоновая обработка документа '{original_file_name}' (ID: {lightrag_doc_id}) началась."
+        )
+
+        # 1. Парсинг документа
+        parsing_span = (
+            langfuse_trace.span(
+                name="parse-document", input={"file_path": temp_file_path}
+            )
+            if langfuse_trace
+            else None
+        )
+        markdown_content_str = await parse_document_to_markdown(temp_file_path)
+        if parsing_span:
+            parsing_span.end(
+                output={
+                    "markdown_length": len(markdown_content_str)
+                    if markdown_content_str
+                    else 0
+                }
+            )
+
+        if not markdown_content_str:
+            logger.error(
+                f"Не удалось извлечь Markdown из документа '{original_file_name}' (ID: {lightrag_doc_id})."
+            )
+            processing_status = "parsing_failed"
+            raise DocumentParsingError("Markdown content is empty.")
+
+        # 2. Добавление записи в БД (статус pending)
+        async with get_session(session_pool) as session:
+            await db_add_document(
+                session=session,
+                lightrag_id=lightrag_doc_id,
+                file_name=original_file_name,
+                uploaded_by_tg_id=user_id,
+                status="processing",  # Сразу ставим processing, т.к. парсинг прошел
+            )
+            db_doc_created = True
+        logger.info(
+            f"Запись о документе '{original_file_name}' (ID: {lightrag_doc_id}) обновлена/добавлена в БД со статусом 'processing'."
+        )
+
+        # 3. Индексация в LightRAG
+        indexing_span = (
+            langfuse_trace.span(
+                name="index-in-lightrag",
+                input={
+                    "doc_id": lightrag_doc_id,
+                    "content_length": len(markdown_content_str),
+                },
+            )
+            if langfuse_trace
+            else None
+        )
+        success_rag_add = await add_document_contents_to_rag(
+            rag_instance=rag_instance,
+            file_path=[original_file_name],  # LightRAG ожидает список
+            documents_content=[markdown_content_str],  # LightRAG ожидает список
+            document_ids=[lightrag_doc_id],  # LightRAG ожидает список
+        )
+        if indexing_span:
+            indexing_span.end(output={"rag_add_successful": success_rag_add})
+
+        # 4. Обновление статуса в БД
+        final_db_status = "processed" if success_rag_add else "indexing_failed"
+        async with get_session(session_pool) as session:
+            await update_document_status(session, lightrag_doc_id, final_db_status)
+
+        processing_status = final_db_status
+        logger.info(
+            f"Документ '{original_file_name}' (ID: {lightrag_doc_id}): финальный статус в БД '{final_db_status}'."
+        )
+
+        # Опционально: уведомить администратора об успешной обработке
+        # await bot.send_message(chat_id, f"Документ '{original_file_name}' успешно обработан.")
+
+    except DocumentParsingError as e:
+        logger.error(
+            f"Ошибка парсинга в фоновой задаче для '{original_file_name}': {e}",
+            exc_info=True,
+        )
+        processing_status = "parsing_failed"
+        if (
+            db_doc_created
+        ):  # Если запись была создана, но парсинг упал позже (маловероятно с текущей логикой)
+            async with get_session(session_pool) as session:
+                await update_document_status(session, lightrag_doc_id, "failed_parsing")
+    except RAGServiceError as e:
+        logger.error(
+            f"Ошибка сервиса RAG в фоновой задаче для '{original_file_name}': {e}",
+            exc_info=True,
+        )
+        processing_status = "rag_error"
+        if db_doc_created:
+            async with get_session(session_pool) as session:
+                await update_document_status(session, lightrag_doc_id, "failed_rag")
+    except Exception as e:
+        logger.error(
+            f"Неожиданная ошибка в фоновой задаче для '{original_file_name}': {e}",
+            exc_info=True,
+        )
+        processing_status = "unknown_background_error"
+        if db_doc_created:
+            async with get_session(session_pool) as session:
+                await update_document_status(session, lightrag_doc_id, "failed_unknown")
+    finally:
+        cleanup_temp_file(temp_file_path)
+        logger.info(
+            f"Фоновая обработка документа '{original_file_name}' (ID: {lightrag_doc_id}) завершена со статусом: {processing_status}."
+        )
+        if langfuse_trace:
+            langfuse_trace.update(
+                output={"final_processing_status": processing_status},
+                level="ERROR"
+                if "failed" in processing_status or "error" in processing_status
+                else "DEFAULT",
+            )
+            # Убедимся, что все данные отправлены
+            if hasattr(langfuse_trace, "client") and langfuse_trace.client:
+                langfuse_trace.client.flush()
+
+
 @admin_router.callback_query(F.data == f"{ADMIN_CALLBACK_PREFIX}main_menu")
 async def handle_admin_main_menu_cb(
     callback: CallbackQuery, state: FSMContext, bot_texts: dict
 ):
     await state.clear()
-
     text_key = "admin_panel_title"
     text = bot_texts.get("admin", {}).get(
         text_key, "Панель администратора. Выберите действие:"
     )
     keyboard = get_admin_main_menu_keyboard()
-
     await callback.message.edit_text(text, reply_markup=keyboard)
     await callback.answer()
 
@@ -111,9 +288,8 @@ async def handle_upload_document_action(
     upload_prompt_key = "admin_doc_upload_prompt"
     prompt_text = bot_texts.get("admin", {}).get(
         upload_prompt_key,
-        "Пожалуйста, отправьте файл документа для загрузки (например, .txt, .pdf, .docx).",
+        "Пожалуйста, отправьте файл документа для загрузки.",
     )
-
     await callback.message.edit_text(prompt_text)
     await state.set_state(AdminUploadDocument.waiting_for_document)
     await callback.answer()
@@ -124,16 +300,13 @@ async def send_admin_main_menu(
     bot_texts: dict,
     state: Optional[FSMContext] = None,
 ):
-    """Отправляет или редактирует сообщение, показывая главное меню администратора."""
     if state:
         await state.clear()
-
     text_key = "admin_panel_title"
     text = bot_texts.get("admin", {}).get(
         text_key, "Панель администратора. Выберите действие:"
     )
     keyboard = get_admin_main_menu_keyboard()
-
     if isinstance(target, Message):
         await target.answer(text, reply_markup=keyboard)
     elif isinstance(target, CallbackQuery):
@@ -142,7 +315,7 @@ async def send_admin_main_menu(
                 await target.message.edit_text(text, reply_markup=keyboard)
             except Exception as e:
                 logger.warning(
-                    f"Не удалось отредактировать сообщение для админ-меню: {e}. Отправка нового."
+                    f"Не удалось отредактировать сообщение для админ-меню: {e}."
                 )
                 await target.message.answer(text, reply_markup=keyboard)
         else:
@@ -160,9 +333,13 @@ async def handle_document_received(
     session_pool: async_sessionmaker[AsyncSession],
     rag_instance: LightRAG,
     bot_texts: dict,
+    cfg: DictConfig,  # Добавлено для передачи в фоновую задачу
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,  # Добавлено
 ):
-    if not message.document:
-        await message.reply("Произошла ошибка: документ не получен.")
+    if not message.document or not message.from_user:
+        await message.reply(
+            "Произошла ошибка: документ или информация о пользователе не получены."
+        )
         return
 
     document_file = message.document
@@ -172,149 +349,62 @@ async def handle_document_received(
     lightrag_doc_id = f"doc_{uuid.uuid4().hex}"
 
     logger.info(
-        f"Администратор {message.from_user.id} загрузил файл: {original_file_name} (MIME: {document_file.mime_type}). Присвоен lightrag_id: {lightrag_doc_id}"
+        f"Администратор {message.from_user.id} загрузил файл: {original_file_name}. Присвоен lightrag_id: {lightrag_doc_id}"
     )
 
-    await message.reply(f"Файл '{original_file_name}' получен. Начинаю обработку...")
-    await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+    # Немедленный ответ администратору
+    await message.reply(
+        f"Файл '{original_file_name}' получен и поставлен в очередь на обработку."
+    )
+    await state.clear()  # Сбрасываем состояние ожидания документа
 
     temp_file_path = None
     downloaded_file_stream = None
-    db_doc_created = False
     try:
         file_info = await bot.get_file(document_file.file_id)
         downloaded_file_stream = await bot.download_file(file_info.file_path)
 
         if not downloaded_file_stream:
-            await message.reply("Не удалось скачать файл.")
-            await state.clear()
+            await message.reply(f"Не удалось скачать файл '{original_file_name}'.")
             return
 
         downloaded_file_bytes = downloaded_file_stream.read()
-
         temp_file_path, _ = await save_uploaded_file_temp(
             downloaded_file_bytes, original_file_name
         )
 
-        logger.info(f"Конвертация документа в Markdown: {temp_file_path}")
-        markdown_content_str = await parse_document_to_markdown(temp_file_path)
-
-        if not markdown_content_str:
-            await message.reply(
-                f"Не удалось извлечь Markdown из документа '{original_file_name}'."
+        # Запуск фоновой задачи
+        asyncio.create_task(
+            _process_document_background(
+                bot=bot,
+                chat_id=message.chat.id,
+                user_id=message.from_user.id,
+                temp_file_path=temp_file_path,
+                original_file_name=original_file_name,
+                lightrag_doc_id=lightrag_doc_id,
+                session_pool=session_pool,
+                rag_instance=rag_instance,
+                bot_texts=bot_texts,
+                cfg=cfg,  # Передаем cfg
+                langfuse_handler=langfuse_handler,  # Передаем langfuse_handler
             )
-            await state.clear()
-            return
+        )
+        # Не нужно вызывать send_admin_main_menu здесь, т.к. ответ уже дан
 
-        logger.info(
-            f"Общая длина извлеченного Markdown: {len(markdown_content_str)} символов."
-        )
-
-        async with get_session(session_pool) as session:
-            await db_add_document(
-                session=session,
-                lightrag_id=lightrag_doc_id,
-                file_name=original_file_name,
-                uploaded_by_tg_id=message.from_user.id,
-                status="pending",
-            )
-            db_doc_created = True
-            logger.info(
-                f"Запись о документе '{original_file_name}' (ID: {lightrag_doc_id}, status: pending) добавлена в БД."
-            )
-
-        logger.info(
-            f"Добавление Markdown содержимого документа '{lightrag_doc_id}' в LightRAG..."
-        )
-        success_rag_add = await add_document_contents_to_rag(
-            rag_instance=rag_instance,
-            file_path=[original_file_name],
-            documents_content=[markdown_content_str],
-            document_ids=[lightrag_doc_id],
-        )
-
-        final_db_status = "processed" if success_rag_add else "failed"
-        async with get_session(session_pool) as session:
-            await update_document_status(session, lightrag_doc_id, final_db_status)
-
-        if success_rag_add:
-            success_message_key = "admin_doc_upload_success"
-            success_text = bot_texts.get("admin", {}).get(
-                success_message_key,
-                "Документ '{file_name}' успешно обработан и добавлен в базу знаний.",
-            )
-            await message.reply(success_text.format(file_name=original_file_name))
-
-        else:
-            error_rag_key = "admin_doc_upload_rag_fail"
-            error_rag_text = bot_texts.get("admin", {}).get(
-                error_rag_key,
-                "Документ '{file_name}' был сохранен, но произошла ошибка при его добавлении/обработке в RAG. Статус в БД: '{status}'. Проверьте логи.",
-            )
-            await message.reply(
-                error_rag_text.format(
-                    file_name=original_file_name, status=final_db_status
-                )
-            )
-            logger.error(
-                f"Ошибка добавления/обработки документа '{lightrag_doc_id}' в LightRAG."
-            )
-
-    except DocumentParsingError as e:
-        logger.error(
-            f"Ошибка парсинга файла '{original_file_name}': {e}", exc_info=True
-        )
-        await message.reply(
-            f"Не удалось обработать файл '{original_file_name}'. Ошибка парсинга: {e}"
-        )
-        if db_doc_created:
-            async with get_session(session_pool) as session:
-                await update_document_status(session, lightrag_doc_id, "failed")
-    except RAGServiceError as e:
-        logger.error(
-            f"Ошибка сервиса RAG при обработке файла '{original_file_name}': {e}",
-            exc_info=True,
-        )
-        await message.reply(
-            f"Произошла ошибка при добавлении документа '{original_file_name}' в RAG: {e}"
-        )
-        if db_doc_created:
-            async with get_session(session_pool) as session:
-                await update_document_status(session, lightrag_doc_id, "failed")
-    except ValueError as e:
-        logger.error(
-            f"Ошибка значения (например, неверный статус) при обработке файла '{original_file_name}': {e}",
-            exc_info=True,
-        )
-        await message.reply(
-            f"Произошла ошибка значения при обработке файла '{original_file_name}'."
-        )
-        if db_doc_created:
-            async with get_session(session_pool) as session:
-                await update_document_status(session, lightrag_doc_id, "failed")
     except Exception as e:
         logger.error(
-            f"Неожиданная ошибка при обработке файла '{original_file_name}': {e}",
+            f"Ошибка на начальном этапе обработки файла '{original_file_name}' (до запуска фоновой задачи): {e}",
             exc_info=True,
         )
         await message.reply(
-            f"Произошла непредвиденная ошибка при обработке файла '{original_file_name}'."
+            f"Произошла ошибка при подготовке файла '{original_file_name}' к обработке."
         )
-        if db_doc_created:
-            try:
-                async with get_session(session_pool) as session:
-                    await update_document_status(session, lightrag_doc_id, "failed")
-            except Exception as db_err:
-                logger.error(
-                    f"Дополнительная ошибка при попытке обновить статус документа {lightrag_doc_id} на ошибку: {db_err}"
-                )
+        if temp_file_path:  # Очистка, если временный файл был создан до ошибки
+            cleanup_temp_file(temp_file_path)
     finally:
         if downloaded_file_stream:
             downloaded_file_stream.close()
-        if temp_file_path:
-            cleanup_temp_file(temp_file_path)
-        await state.clear()
-        await send_admin_main_menu(message, bot_texts, state)
+        # Не очищаем temp_file_path здесь, это делает фоновая задача
 
 
 @admin_router.message(AdminUploadDocument.waiting_for_document)
@@ -329,48 +419,67 @@ async def handle_wrong_content_for_upload(message: Message, bot_texts: dict):
 async def show_documents_page(
     callback_or_message: Union[CallbackQuery, Message],
     session_pool: async_sessionmaker[AsyncSession],
-    rag_instance: LightRAG,
+    rag_instance: LightRAG,  # rag_instance нужен для get_multiple_document_statuses_from_rag
     bot_texts: dict,
     page: int = 1,
     action_context: str = "list",
 ):
     async with get_session(session_pool) as session:
         db_docs_query_result: List[DB_Document] = await get_documents_for_admin_list(
-            session, limit=1000
+            session, limit=1000  # Можно сделать лимит настраиваемым
         )
 
     total_db_docs = len(db_docs_query_result)
-
     doc_ids_from_db = [doc.lightrag_id for doc in db_docs_query_result]
     rag_statuses: Dict[str, Optional[str]] = {}
     if doc_ids_from_db:
-        rag_statuses = await get_multiple_document_statuses_from_rag(
-            rag_instance, doc_ids_from_db
-        )
+        try:
+            rag_statuses = await get_multiple_document_statuses_from_rag(
+                rag_instance, doc_ids_from_db
+            )
+        except Exception as e_rag_status:
+            logger.error(
+                f"Ошибка при получении статусов из RAG для списка документов: {e_rag_status}"
+            )
+            # Заполняем статусы ошибкой, чтобы UI это отразил
+            rag_statuses = {doc_id: "Ошибка RAG" for doc_id in doc_ids_from_db}
 
     enriched_documents = []
     for db_doc in db_docs_query_result:
-        db_status = db_doc.status
+        # Статус из БД - основной источник правды об обработке
+        db_status_display = db_doc.status
+
+        # Статус из RAG - дополнительная информация о наличии в вектороном хранилище
         raw_rag_status = rag_statuses.get(db_doc.lightrag_id)
-        display_rag_status: str
+        rag_status_for_display: str
 
-        if raw_rag_status is None:
-            display_rag_status = "Нет в RAG"
-        elif raw_rag_status == "ошибка_запроса_статуса":
-            display_rag_status = "Ошибка RAG"
-        elif raw_rag_status == "N/A":
-            display_rag_status = "Метод RAG N/A"
-        else:
-            display_rag_status = raw_rag_status
+        if (
+            db_doc.status == "processed"
+        ):  # Если в БД "processed", ожидаем, что в RAG тоже "processed"
+            rag_status_for_display = (
+                raw_rag_status if raw_rag_status else "Нет в RAG (ожидался)"
+            )
+            if raw_rag_status and raw_rag_status.lower() != "processed":
+                rag_status_for_display = f"RAG: {raw_rag_status} (ожидался processed)"
+        elif db_doc.status in ["pending", "processing"]:
+            rag_status_for_display = "Обрабатывается"
+        elif "failed" in db_doc.status:
+            rag_status_for_display = "Ошибка обработки"
+        elif db_doc.status == "deleted_by_admin":
+            rag_status_for_display = "Удален админом"
+        else:  # Неизвестный статус из БД
+            rag_status_for_display = raw_rag_status if raw_rag_status else "N/A"
 
-        setattr(db_doc, "db_status_display", db_status)
-        setattr(db_doc, "rag_status_display", display_rag_status)
+        setattr(
+            db_doc,
+            "display_status_line",
+            f"БД: {db_status_display}, RAG: {rag_status_for_display}",
+        )
         enriched_documents.append(db_doc)
 
     total_pages = (total_db_docs + DOCS_PER_PAGE - 1) // DOCS_PER_PAGE
     if total_pages == 0:
         page = 1
-
     if page < 1:
         page = 1
     if page > total_pages and total_pages > 0:
@@ -387,16 +496,16 @@ async def show_documents_page(
         )
         keyboard = get_admin_main_menu_keyboard()
     else:
-        if action_context == "delete":
-            text_template_key = "admin_docs_select_for_delete"
-            default_text_template = (
-                "Выберите документ для удаления (Страница {page}/{total_pages}):"
-            )
-        else:
-            text_template_key = "admin_docs_list_title"
-            default_text_template = (
-                "Список загруженных документов (Страница {page}/{total_pages}):"
-            )
+        text_template_key = (
+            "admin_docs_list_title_v2"
+            if action_context == "list"
+            else "admin_docs_select_for_delete_v2"
+        )
+        default_text_template = (
+            "Документы (Стр. {page}/{total_pages}):"
+            if action_context == "list"
+            else "Удаление (Стр. {page}/{total_pages}):"
+        )
 
         text_template = bot_texts.get("admin", {}).get(
             text_template_key, default_text_template
@@ -405,14 +514,20 @@ async def show_documents_page(
             page=page, total_pages=total_pages if total_pages > 0 else 1
         )
 
-        keyboard = get_documents_list_keyboard(documents_on_page, page, total_pages)
+        # Передаем display_status_line в клавиатуру
+        keyboard = get_documents_list_keyboard(
+            documents_on_page,
+            current_page=page,
+            total_pages=total_pages if total_pages > 0 else 1,
+            context=action_context,  # Передаем контекст для callback_data кнопок
+        )
 
     if isinstance(callback_or_message, CallbackQuery):
         try:
             await callback_or_message.message.edit_text(text, reply_markup=keyboard)
         except Exception as e:
             logger.warning(
-                f"Не удалось отредактировать сообщение для списка документов: {e}. Попытка отправить новое."
+                f"Не удалось отредактировать сообщение для списка документов: {e}."
             )
             if callback_or_message.message:
                 await callback_or_message.message.answer(text, reply_markup=keyboard)
@@ -453,14 +568,14 @@ async def handle_document_page_action(
     bot_texts: dict,
 ):
     try:
-        page = int(callback.data.split(DOC_PAGE_PREFIX)[1])
+        parts = callback.data.split(DOC_PAGE_PREFIX)[1].split(
+            "_"
+        )  # page_1_list -> ["1", "list"]
+        page = int(parts[0])
         action_ctx = (
-            "delete"
-            if callback.message
-            and callback.message.text
-            and "удаления" in callback.message.text.lower()
-            else "list"
-        )
+            parts[1] if len(parts) > 1 else "list"
+        )  # По умолчанию 'list', если контекст не передан
+
         await show_documents_page(
             callback,
             session_pool,
@@ -471,17 +586,19 @@ async def handle_document_page_action(
         )
     except (ValueError, IndexError) as e:
         logger.error(
-            f"Ошибка парсинга страницы из callback_data '{callback.data}': {e}"
+            f"Ошибка парсинга страницы/контекста из callback_data '{callback.data}': {e}"
         )
         await callback.answer("Ошибка навигации.", show_alert=True)
 
 
-@admin_router.callback_query(F.data.startswith(DOC_SELECT_PREFIX))
+@admin_router.callback_query(
+    F.data.startswith(DOC_SELECT_PREFIX)
+)  # Используется для выбора документа для удаления
 async def handle_document_select_for_delete(
     callback: CallbackQuery,
     session_pool: async_sessionmaker[AsyncSession],
     bot_texts: dict,
-    state: FSMContext,
+    state: FSMContext,  # state может быть не нужен здесь, если мы не устанавливаем FSM
 ):
     try:
         doc_lightrag_id = callback.data.split(DOC_SELECT_PREFIX)[1]
@@ -497,16 +614,24 @@ async def handle_document_select_for_delete(
 
     if not document:
         logger.warning(
-            f"Попытка удалить несуществующий документ (ID: {doc_lightrag_id}) из callback."
+            f"Попытка удалить несуществующий документ (ID: {doc_lightrag_id})."
         )
         await callback.answer("Документ не найден.", show_alert=True)
-        await handle_admin_main_menu_cb(callback, state, bot_texts)
+        # Вместо вызова handle_admin_main_menu_cb, можно просто закрыть текущее сообщение или обновить список
+        await show_documents_page(
+            callback,
+            session_pool,
+            callback.bot.rag_instance,
+            bot_texts,
+            page=1,
+            action_context="delete",
+        )  # callback.bot.rag_instance - нужно передать rag_instance
         return
 
     confirm_text_key = "admin_doc_delete_confirm_prompt"
     confirm_text_template = bot_texts.get("admin", {}).get(
         confirm_text_key,
-        "Вы уверены, что хотите удалить документ '{file_name}' (ID: {doc_id})?\nЭто действие нельзя будет отменить.",
+        "Вы уверены, что хотите удалить документ '{file_name}' (ID: {doc_id})?",
     )
     text = confirm_text_template.format(
         file_name=document.file_name, doc_id=document.lightrag_id
@@ -525,72 +650,116 @@ async def handle_document_delete_confirm(
     session_pool: async_sessionmaker[AsyncSession],
     rag_instance: LightRAG,
     bot_texts: dict,
-    bot: Bot,
-    state: FSMContext,
+    bot: Bot,  # bot нужен для send_chat_action и edit_text
+    # state: FSMContext, # state здесь не используется
 ):
     try:
         doc_lightrag_id = callback.data.split(DOC_DELETE_CONFIRM_PREFIX)[1]
     except IndexError:
         logger.error(
-            f"Не удалось извлечь ID документа из callback_data для подтверждения удаления: {callback.data}"
+            f"Не удалось извлечь ID из callback_data для подтверждения удаления: {callback.data}"
         )
         await callback.answer("Ошибка: неверный ID документа.", show_alert=True)
         return
 
-    await callback.message.edit_text("Удаление документа, пожалуйста, подождите...")
-    await bot.send_chat_action(
-        chat_id=callback.message.chat.id, action=ChatAction.TYPING
-    )
+    if callback.message:  # Проверка что callback.message существует
+        await callback.message.edit_text("Удаление документа, пожалуйста, подождите...")
+        await bot.send_chat_action(
+            chat_id=callback.message.chat.id, action=ChatAction.TYPING
+        )
 
     doc_name_for_message = "Неизвестный документ"
-    success = False
+    success_db_mark = False
+    success_rag_delete = False
+
+    langfuse_trace_delete = None
+    # cfg должен быть доступен, если он передается в dispatcher и затем в хендлеры
+    # Для этого нужно добавить cfg в аргументы функции или получить из bot.cfg, если он там есть
+    # В данном примере предполагаем, что cfg доступен через callback.bot.cfg или аналогично
+    current_cfg = getattr(callback.bot, "cfg", None)
+    if current_cfg and current_cfg.langfuse.enabled:
+        try:
+            langfuse_client_delete = Langfuse(
+                public_key=current_cfg.langfuse.public_key,
+                secret_key=current_cfg.langfuse.secret_key,
+                host=current_cfg.langfuse.host,
+            )
+            langfuse_trace_delete = langfuse_client_delete.trace(
+                name="document-delete-pipeline",
+                user_id=str(callback.from_user.id),
+                metadata={"lightrag_doc_id": doc_lightrag_id},
+            )
+        except Exception as e_lf_del:
+            logger.error(f"Ошибка инициализации Langfuse для удаления: {e_lf_del}")
+
     try:
         async with get_session(session_pool) as session:
             db_doc = await get_document_by_lightrag_id(session, doc_lightrag_id)
             if db_doc:
                 doc_name_for_message = db_doc.file_name
                 await mark_document_as_deleted_by_admin(session, doc_lightrag_id)
+                success_db_mark = True
                 logger.info(
                     f"Документ '{doc_name_for_message}' (ID: {doc_lightrag_id}) помечен как 'deleted_by_admin' в БД."
                 )
-
-                logger.info(f"Удаление документа '{doc_lightrag_id}' из LightRAG...")
-                rag_delete_success = await rag_delete_document(
-                    rag_instance, doc_lightrag_id
-                )
-                if rag_delete_success:
-                    logger.info(
-                        f"Документ '{doc_lightrag_id}' успешно удален из LightRAG."
-                    )
-                    success = True
-                else:
-                    logger.error(
-                        f"Ошибка при удалении документа '{doc_lightrag_id}' из LightRAG. Статус в БД 'deleted_by_admin'."
-                    )
             else:
                 logger.warning(
                     f"Документ с ID '{doc_lightrag_id}' не найден в БД при подтверждении удаления."
                 )
 
-        if success:
+        if success_db_mark:  # Удаляем из RAG только если в БД успешно помечен
+            rag_delete_span = (
+                langfuse_trace_delete.span(
+                    name="delete-from-lightrag", input={"doc_id": doc_lightrag_id}
+                )
+                if langfuse_trace_delete
+                else None
+            )
+            success_rag_delete = await rag_delete_document(
+                rag_instance, doc_lightrag_id
+            )
+            if rag_delete_span:
+                rag_delete_span.end(
+                    output={"rag_delete_successful": success_rag_delete}
+                )
+
+            if success_rag_delete:
+                logger.info(f"Документ '{doc_lightrag_id}' успешно удален из LightRAG.")
+            else:
+                logger.error(
+                    f"Ошибка при удалении документа '{doc_lightrag_id}' из LightRAG."
+                )
+
+        final_message_text: str
+        if success_db_mark and success_rag_delete:
             text_key = "admin_doc_delete_success"
-            text = (
+            final_message_text = (
                 bot_texts.get("admin", {})
                 .get(text_key, "Документ '{file_name}' успешно удален.")
                 .format(file_name=doc_name_for_message)
             )
-        else:
-            text_key = "admin_doc_delete_fail"
-            text = (
+        elif success_db_mark and not success_rag_delete:
+            text_key = "admin_doc_delete_db_ok_rag_fail"
+            final_message_text = (
                 bot_texts.get("admin", {})
                 .get(
                     text_key,
-                    "Не удалось удалить документ '{file_name}'. Проверьте логи.",
+                    "Документ '{file_name}' помечен как удаленный, но ошибка при удалении из RAG. Проверьте логи.",
                 )
                 .format(file_name=doc_name_for_message)
             )
+        else:  # Документ не найден в БД или другая ошибка на этапе БД
+            text_key = "admin_doc_delete_fail_db"
+            final_message_text = (
+                bot_texts.get("admin", {})
+                .get(text_key, "Не удалось удалить документ '{file_name}' (ошибка БД).")
+                .format(file_name=doc_name_for_message)
+            )
 
-        await callback.message.edit_text(text)
+        if callback.message:  # Проверка что callback.message существует
+            await callback.message.edit_text(final_message_text)
+
+        # Обновляем список документов после удаления
         await show_documents_page(
             callback,
             session_pool,
@@ -605,15 +774,28 @@ async def handle_document_delete_confirm(
             f"Ошибка при подтверждении удаления документа {doc_lightrag_id}: {e}",
             exc_info=True,
         )
-        error_key = "error_generic"
+        error_key = "error_generic_delete"
         error_text = bot_texts.get("errors", {}).get(
             error_key, "Произошла ошибка при удалении."
         )
-        try:
-            await callback.message.edit_text(error_text)
-        except Exception:
-            logger.error("Не удалось отправить сообщение об ошибке при удалении.")
+        if callback.message:  # Проверка что callback.message существует
+            try:
+                await callback.message.edit_text(error_text)
+            except Exception:  # noqa
+                logger.error("Не удалось отправить сообщение об ошибке при удалении.")
     finally:
+        if langfuse_trace_delete:
+            langfuse_trace_delete.update(
+                output={
+                    "db_marked_deleted": success_db_mark,
+                    "rag_deleted": success_rag_delete,
+                }
+            )
+            if (
+                hasattr(langfuse_trace_delete, "client")
+                and langfuse_trace_delete.client
+            ):
+                langfuse_trace_delete.client.flush()
         await callback.answer()
 
 
@@ -623,7 +805,7 @@ async def handle_document_delete_cancel(
     session_pool: async_sessionmaker[AsyncSession],
     rag_instance: LightRAG,
     bot_texts: dict,
-    state: FSMContext,
+    # state: FSMContext, # state здесь не используется
 ):
     await callback.answer("Удаление отменено.")
     await show_documents_page(

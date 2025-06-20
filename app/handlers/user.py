@@ -1,20 +1,91 @@
-from typing import Any, Dict, List
+from typing import Optional
 
 from aiogram import Bot, F, Router, types
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
-from keyboards.admin_kb import get_admin_main_menu_keyboard
-from lightrag import LightRAG
+from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+from langgraph.graph import StatefulGraph
 from loguru import logger
-from services.db_service import get_or_create_user, get_session
-from services.rag_service import RAGServiceError, get_rag_answer
+from omegaconf import DictConfig
+from services.db_service import (  # Используем get_or_create_student
+    get_or_create_student,
+    get_session,
+)
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from app.agents.state import TutorGraphState
 
 user_router = Router(name="user_handlers")
 
-MAX_HISTORY_MESSAGES = 5
-DEFAULT_LLM_MODE = "standard"
+
+async def handle_graph_output(
+    output_state: TutorGraphState, message: types.Message, bot_texts: dict
+):
+    """Обрабатывает состояние, полученное от графа, и отправляет ответ пользователю."""
+    if output_state.get("error_message"):
+        logger.error(
+            f"Ошибка от графа для пользователя {message.from_user.id}: {output_state['error_message']}"
+        )
+        error_text = bot_texts.get("errors", {}).get(
+            "error_graph_processing", "Произошла ошибка при обработке вашего запроса."
+        )
+        await message.answer(error_text)
+        return
+
+    response_parts = []
+    # Сначала информация о теме, если она обновилась и нет вопроса/фидбека
+    # Это может быть полезно после curriculum_agent
+    if (
+        output_state.get("current_topic_name")
+        and not output_state.get("assessment_question")
+        and not output_state.get("assessment_feedback")
+        and not output_state.get("recommendations")
+    ):
+        response_parts.append(
+            f"Текущая тема: \"{output_state['current_topic_name']}\"."
+        )
+        if output_state.get("current_learning_objectives"):
+            response_parts.append(
+                f"Цели обучения: {output_state['current_learning_objectives']}"
+            )
+        # Можно добавить предложение начать, если это первый вход в тему
+        # response_parts.append("Готовы начать или есть вопросы по этой теме?")
+
+    if output_state.get("assessment_feedback"):
+        response_parts.append(
+            f"**Оценка вашего ответа:**\n{output_state['assessment_feedback']}"
+        )
+
+    if output_state.get("assessment_question"):
+        # Если есть и фидбек, и новый вопрос, они будут вместе.
+        # Если только вопрос, то только он.
+        response_parts.append(
+            f"**Вопрос для вас:**\n{output_state['assessment_question']}"
+        )
+
+    if output_state.get("recommendations"):
+        recommendations_str = "\n".join(
+            [f"- {rec}" for rec in output_state["recommendations"]]
+        )
+        response_parts.append(f"**Рекомендации:**\n{recommendations_str}")
+
+    if not response_parts:
+        logger.warning(
+            f"Граф вернул состояние без явного текстового ответа для пользователя {message.from_user.id}"
+        )
+        # Можно отправить дефолтное сообщение, если это не ожидание ввода от пользователя (например, после /start)
+        # if not output_state.get("assessment_question"): # Если не ждем ответа на вопрос
+        #     response_parts.append(bot_texts.get("user_messages", {}).get("graph_no_specific_output", "Продолжим?"))
+
+    if response_parts:
+        await message.answer(
+            "\n\n".join(response_parts), parse_mode="Markdown"
+        )  # Добавлен parse_mode для Markdown
+    elif not output_state.get("error_message"):
+        logger.info(
+            f"Граф для пользователя {message.from_user.id} завершил обработку без текстового вывода для пользователя на данном шаге."
+        )
 
 
 @user_router.message(CommandStart())
@@ -22,143 +93,104 @@ async def handle_start_command(
     message: types.Message,
     state: FSMContext,
     session_pool: async_sessionmaker[AsyncSession],
+    bot: Bot,
     bot_texts: dict,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[
+        LangfuseCallbackHandler
+    ] = None,  # Получаем из Dispatcher
 ):
     user = message.from_user
     if not user:
-        logger.warning(
-            "Получено сообщение без информации о пользователе в CommandStart."
-        )
-        await message.answer(
-            "Не удалось получить информацию о пользователе. Попробуйте еще раз."
-        )
+        await message.answer("Не удалось получить информацию о пользователе.")
         return
 
     logger.info(
         f"Пользователь {user.id} ({user.username or 'N/A'}) вызвал команду /start."
     )
-
     await state.clear()
-    await state.update_data(chat_history=[], llm_mode=DEFAULT_LLM_MODE)
-    logger.info(
-        f"Для пользователя {user.id} установлен режим LLM по умолчанию: {DEFAULT_LLM_MODE}."
+
+    async with get_session(session_pool) as db_session:
+        db_student_model, created = await get_or_create_student(
+            session=db_session,
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+        )
+        if created:
+            logger.info(f"Новый студент {db_student_model.user_id} зарегистрирован.")
+        else:
+            logger.info(f"Студент {db_student_model.user_id} уже существует.")
+
+    initial_graph_input = TutorGraphState(
+        student_id=user.id,
+        student_profile=None,
+        input_query=None,
+        chat_history=[],
+        current_topic_id=None,
+        current_topic_name=None,
+        current_learning_objectives=None,
+        retrieved_context=None,
+        assessment_question=None,
+        student_answer=None,
+        assessment_feedback=None,
+        recommendations=None,
+        error_message=None,
     )
 
     try:
-        async with get_session(session_pool) as session:
-            db_user, created = await get_or_create_user(
-                session=session,
-                user_id=user.id,
-                username=user.username,
-                first_name=user.first_name,
-                last_name=user.last_name,
+        await message.answer(
+            bot_texts.get("user_messages", {}).get(
+                "start_graph_processing", "Инициализация вашего учебного плана..."
             )
+        )
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
-            if created:
-                logger.info(
-                    f"Новый пользователь {db_user.user_id} зарегистрирован с is_admin={db_user.is_admin}."
-                )
-            else:
-                logger.info(
-                    f"Пользователь {db_user.user_id} уже существует (is_admin={db_user.is_admin}), данные обновлены (если требовалось)."
-                )
-
-        if db_user and db_user.is_admin:
+        config_for_graph_call = {"configurable": {"thread_id": str(user.id)}}
+        if cfg.langfuse.enabled and langfuse_handler:
+            # Langfuse трейсинг для вызовов LangChain компонентов внутри графа
+            config_for_graph_call["callbacks"] = [langfuse_handler]
             logger.info(
-                f"Пользователь {user.id} является администратором (is_admin=True в БД). Показываем админ-меню."
+                f"Langfuse callback handler добавлен для вызова графа пользователя {user.id}"
             )
-            admin_menu_text_key = "admin_welcome"
-            admin_text = bot_texts.get("admin", {}).get(
-                admin_menu_text_key,
-                "Добро пожаловать, Администратор! Ваша панель управления:",
-            )
-            keyboard = get_admin_main_menu_keyboard()
-            await message.answer(text=admin_text, reply_markup=keyboard)
+
+        final_output_state = None
+        # Используем .invoke() для получения только финального состояния после всех шагов,
+        # если граф спроектирован так, чтобы выдать все необходимое за один "проход" до первого END (вопроса студенту)
+        # Или astream, если хотим обрабатывать промежуточные ответы/действия
+
+        # output = await tutor_graph.ainvoke(initial_graph_input, config=config_for_graph_call)
+        # final_output_state = output # ainvoke возвращает финальное состояние
+
+        # Используем astream, если граф может остановиться на полпути (например, задать вопрос)
+        # и мы хотим получить это состояние. stream_mode="values" дает полное состояние на каждом шаге.
+        async for event_state in tutor_graph.astream(
+            initial_graph_input, config=config_for_graph_call, stream_mode="values"
+        ):
+            final_output_state = event_state
+
+        if final_output_state:
+            await handle_graph_output(final_output_state, message, bot_texts)
         else:
-            logger.info(
-                f"Пользователь {user.id} является обычным пользователем (is_admin=False или не найден в БД)."
+            logger.error(
+                f"Граф не вернул финального состояния для пользователя {user.id} при /start."
             )
-            greeting_message_key = "user_greeting"
-
-            start_texts = bot_texts.get("start", {})
-            if not isinstance(start_texts, dict):
-                logger.warning(
-                    f"Секция 'start' в bot_texts не является словарем: {start_texts}"
+            await message.answer(
+                bot_texts.get("errors", {}).get(
+                    "error_graph_start_failed", "Не удалось начать сессию."
                 )
-                start_texts = {}
-
-            if greeting_message_key not in start_texts:
-                logger.warning(
-                    f"Ключ '{greeting_message_key}' не найден в bot_texts['start']. Используется сообщение по умолчанию."
-                )
-                greeting_text = f"Здравствуйте, {user.first_name or user.username}!\nЯ ваш помощник по учебным материалам."
-            else:
-                greeting_template = start_texts.get(greeting_message_key, "Привет!")
-                greeting_text = greeting_template.format(
-                    user_first_name=user.first_name or "",
-                    user_username=user.username or "пользователь",
-                )
-
-            user_commands_texts = bot_texts.get("user_commands", {})
-            if not isinstance(user_commands_texts, dict):
-                logger.warning(
-                    f"Секция 'user_commands' в bot_texts не является словарем: {user_commands_texts}"
-                )
-                user_commands_texts = {}
-
-            mode_display_key = "current_llm_mode_display"
-            mode_display_template = user_commands_texts.get(
-                mode_display_key, "\nТекущий режим ответов: {mode_name}."
             )
-
-            fsm_data = await state.get_data()
-            current_llm_mode_for_display = fsm_data.get("llm_mode", DEFAULT_LLM_MODE)
-            mode_name = (
-                "Стандартный"
-                if current_llm_mode_for_display == "standard"
-                else "Размышление"
-            )
-            greeting_text += mode_display_template.format(mode_name=mode_name)
-
-            await message.answer(text=greeting_text)
 
     except Exception as e:
         logger.error(
-            f"Ошибка при обработке команды /start для пользователя {user.id}: {e}",
+            f"Ошибка при первом вызове графа для пользователя {user.id}: {e}",
             exc_info=True,
         )
-        error_message_key = "error_generic"
-        error_text_template = bot_texts.get("errors", {}).get(
-            error_message_key, "Произошла ошибка. Пожалуйста, попробуйте позже."
+        await message.answer(
+            bot_texts.get("errors", {}).get("error_generic", "Произошла ошибка.")
         )
-        error_text = str(error_text_template)
-        await message.answer(error_text)
-
-
-@user_router.message(Command("toggle_mode"))
-async def handle_toggle_llm_mode(
-    message: types.Message, state: FSMContext, bot_texts: dict
-):
-    user = message.from_user
-    if not user:
-        return
-
-    current_data = await state.get_data()
-    current_mode = current_data.get("llm_mode", DEFAULT_LLM_MODE)
-
-    new_mode = "thinking" if current_mode == "standard" else "standard"
-    await state.update_data(llm_mode=new_mode)
-
-    mode_switched_key = "llm_mode_switched"
-    mode_name_display = "Стандартный" if new_mode == "standard" else "Размышление"
-
-    text_template = bot_texts.get("user_commands", {}).get(
-        mode_switched_key, "Режим LLM изменен на: {mode_name}."
-    )
-    response_text = text_template.format(mode_name=mode_name_display)
-
-    await message.answer(response_text)
-    logger.info(f"Пользователь {user.id} переключил режим LLM на: {new_mode}.")
 
 
 @user_router.message(
@@ -167,109 +199,165 @@ async def handle_toggle_llm_mode(
 async def handle_text_message(
     message: types.Message,
     state: FSMContext,
-    rag_instance: LightRAG,
-    bot_texts: dict,
     bot: Bot,
-    llm_base_config: Dict[str, Any],
+    tutor_graph: StatefulGraph,
+    bot_texts: dict,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
 ):
     user = message.from_user
     if not user or not message.text:
-        logger.warning(
-            "Получено пустое текстовое сообщение или нет информации о пользователе."
-        )
         return
 
     query_text = message.text
-    logger.info(
-        f"Пользователь {user.id} отправил текстовый запрос: '{query_text[:50]}...'"
-    )
-
+    logger.info(f"Пользователь {user.id} отправил: '{query_text[:50]}...'")
     await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
 
+    # Входные данные для графа: текущий ответ/запрос пользователя.
+    # Граф сам подтянет предыдущее состояние по thread_id благодаря MemorySaver.
+    graph_input_update = {
+        # "input_query": query_text, # Если это новый независимый запрос
+        "student_answer": query_text  # Если это ответ на вопрос графа
+    }
+    # Можно добавить логику, чтобы различать новый запрос и ответ на вопрос,
+    # например, проверяя, есть ли в состоянии графа `assessment_question`.
+    # Пока для простоты считаем, что любой текст - это `student_answer`.
+    # `input_query` можно устанавливать, если это первый запрос в новой теме или после /start.
+
     try:
-        data = await state.get_data()
-        current_chat_history: List[Dict[str, str]] = data.get("chat_history", [])
-        user_llm_mode = data.get("llm_mode", DEFAULT_LLM_MODE)
-
-        logger.debug(
-            f"Пользователь {user.id}: режим LLM '{user_llm_mode}' для запроса."
-        )
-        logger.debug(
-            f"Текущая история чата для пользователя {user.id} (перед запросом): {current_chat_history}"
-        )
-        logger.debug(
-            f"Длина текущая история чата для пользователя {user.id} (перед запросом): {len(current_chat_history)}"
-        )
-
-        rag_answer = await get_rag_answer(
-            rag_instance=rag_instance,
-            query_text=query_text,
-            chat_history=current_chat_history,
-            user_llm_mode=user_llm_mode,
-            llm_base_config=llm_base_config,
-        )
-
-        if rag_answer:
-            await message.answer(rag_answer)
-            current_chat_history.append({"role": "user", "content": query_text})
-            current_chat_history.append({"role": "assistant", "content": rag_answer})
-            if len(current_chat_history) > MAX_HISTORY_MESSAGES * 2:
-                current_chat_history = current_chat_history[
-                    -(MAX_HISTORY_MESSAGES * 2) :
-                ]
-
-            await state.update_data(chat_history=current_chat_history)
-            logger.debug(
-                f"История чата для пользователя {user.id} (после ответа): {current_chat_history}"
+        config_for_graph_call = {"configurable": {"thread_id": str(user.id)}}
+        if cfg.langfuse.enabled and langfuse_handler:
+            config_for_graph_call["callbacks"] = [langfuse_handler]
+            logger.info(
+                f"Langfuse callback handler добавлен для вызова графа пользователя {user.id} (текстовое сообщение)"
             )
-            logger.debug(
-                f"Длина история чата для пользователя {user.id} (после ответа): {len(current_chat_history)}"
-            )
+
+        final_output_state = None
+        logger.debug(f"Вызов графа для пользователя {user.id} с текстом: {query_text}")
+
+        # `ainvoke` передает `graph_input_update` как вход для START узла,
+        # но если граф уже был запущен для этого thread_id, он продолжит с сохраненного состояния,
+        # и `graph_input_update` будет входными данными для следующего узла, который ожидает ввод.
+        # В нашем случае, если граф остановился на END после assessment_question,
+        # то `student_answer` из `graph_input_update` должен быть подхвачен.
+        # Это зависит от того, как определен вход у узлов после точки ожидания.
+        # Обычно, `ainvoke` с новым input перезапускает граф с этим input, если нет активного состояния.
+        # Если есть активное состояние (т.е. граф ждет), то новый input должен быть обработан как продолжение.
+        # Для диалоговых графов, которые ждут ввода, `astream` или явное управление состоянием может быть надежнее.
+        # Однако, `StatefulGraph` с чекпоинтером должен корректно обрабатывать это:
+        # он загружает состояние и передает новый ввод.
+
+        # output = await tutor_graph.ainvoke(graph_input_update, config=config_for_graph_call)
+        # final_output_state = output
+
+        async for event_state in tutor_graph.astream(
+            graph_input_update, config=config_for_graph_call, stream_mode="values"
+        ):
+            final_output_state = event_state
+
+        if final_output_state:
+            await handle_graph_output(final_output_state, message, bot_texts)
         else:
-            logger.warning(f"RAG вернул пустой ответ на запрос: '{query_text}'")
-            no_answer_key = "rag_no_answer"
-            no_answer_text = bot_texts.get("rag", {}).get(
-                no_answer_key, "К сожалению, я не смог найти ответ на ваш вопрос."
+            logger.error(
+                f"Граф не вернул финального состояния для {user.id} при обработке сообщения."
             )
-            await message.answer(no_answer_text)
+            await message.answer(
+                bot_texts.get("errors", {}).get(
+                    "error_graph_processing", "Не удалось обработать ваш запрос."
+                )
+            )
 
-    except RAGServiceError as e:
-        logger.error(
-            f"Ошибка RAG сервиса для пользователя {user.id} с запросом '{query_text}': {e}",
-            exc_info=True,
-        )
-        error_message_key = "error_rag_processing"
-        error_text = bot_texts.get("errors", {}).get(
-            error_message_key,
-            "Возникла проблема при обработке вашего запроса. Попробуйте еще раз.",
-        )
-        await message.answer(error_text)
     except Exception as e:
         logger.error(
-            f"Неожиданная ошибка при обработке текстового сообщения от {user.id}: {e}",
-            exc_info=True,
+            f"Ошибка при вызове графа для сообщения от {user.id}: {e}", exc_info=True
         )
-        error_message_key = "error_generic"
-        error_text = bot_texts.get("errors", {}).get(
-            error_message_key,
-            "Произошла непредвиденная ошибка. Пожалуйста, попробуйте позже.",
+        await message.answer(
+            bot_texts.get("errors", {}).get("error_generic", "Произошла ошибка.")
         )
-        await message.answer(error_text)
 
 
 @user_router.message(Command("clear_history"))
 async def handle_clear_history_command(
-    message: types.Message, state: FSMContext, bot_texts: dict
+    message: types.Message,
+    state: FSMContext,
+    tutor_graph: StatefulGraph,  # Нужен для доступа к checkpointer, если хотим чистить
+    bot_texts: dict,
+    cfg: DictConfig,
 ):
     user = message.from_user
     if not user:
         return
 
-    await state.update_data(chat_history=[])
-    logger.info(f"История чата для пользователя {user.id} очищена.")
+    logger.info(f"Пользователь {user.id} вызвал /clear_history.")
+    await state.clear()  # Очищаем FSM состояние, если оно для чего-то используется
 
-    clear_confirm_key = "chat_history_cleared"
+    # Очистка состояния LangGraph для данного пользователя (thread_id)
+    # Для MemorySaver это означает удаление записи из его внутреннего словаря.
+    # Доступ к checkpointer'у графа: tutor_graph.checkpointer
+    if tutor_graph.checkpointer and hasattr(
+        tutor_graph.checkpointer, "storage"
+    ):  # Проверяем, что это MemorySaver
+        thread_id = str(user.id)
+        if thread_id in tutor_graph.checkpointer.storage:
+            del tutor_graph.checkpointer.storage[thread_id]
+            logger.info(
+                f"Состояние графа для thread_id='{thread_id}' очищено из MemorySaver."
+            )
+            clear_confirm_key = "chat_history_cleared_graph_ok"
+            default_text = "История вашего диалога с тьютором очищена. Следующее сообщение начнет новую сессию."
+        else:
+            logger.info(
+                f"Состояние графа для thread_id='{thread_id}' не найдено в MemorySaver для очистки."
+            )
+            clear_confirm_key = "chat_history_cleared_graph_not_found"
+            default_text = "Активная сессия с тьютором не найдена для очистки. Следующее сообщение начнет новую."
+    else:
+        logger.warning(
+            "Не удалось очистить состояние графа: checkpointer не MemorySaver или отсутствует."
+        )
+        clear_confirm_key = "chat_history_cleared_graph_failed"
+        default_text = "Не удалось полностью очистить историю сессии с тьютором. Попробуйте команду /start."
+
     clear_confirm_text = bot_texts.get("user_commands", {}).get(
-        clear_confirm_key, "История вашей переписки очищена."
+        clear_confirm_key, default_text
     )
     await message.answer(clear_confirm_text)
+
+
+# Команда /toggle_mode - оставляем как есть, она влияет на старый LightRAG режим, если он где-то используется
+@user_router.message(Command("toggle_mode"))
+async def handle_toggle_llm_mode(
+    message: types.Message, state: FSMContext, bot_texts: dict
+):
+    # ... (код как был, с комментариями о его применимости) ...
+    user = message.from_user
+    if not user:
+        return
+
+    current_data = await state.get_data()
+    DEFAULT_LLM_MODE_LIGHTRAG = "standard"
+    current_mode_lightrag = current_data.get(
+        "llm_mode_lightrag", DEFAULT_LLM_MODE_LIGHTRAG
+    )
+
+    new_mode_lightrag = (
+        "thinking" if current_mode_lightrag == "standard" else "standard"
+    )
+    await state.update_data(llm_mode_lightrag=new_mode_lightrag)
+
+    mode_switched_key = "llm_mode_switched"
+    mode_name_display = (
+        "Стандартный (LightRAG)"
+        if new_mode_lightrag == "standard"
+        else "Размышление (LightRAG)"
+    )
+
+    text_template = bot_texts.get("user_commands", {}).get(
+        mode_switched_key, "Режим LLM (для LightRAG) изменен на: {mode_name}."
+    )
+    response_text = text_template.format(mode_name=mode_name_display)
+
+    await message.answer(response_text)
+    logger.info(
+        f"Пользователь {user.id} переключил режим LLM для LightRAG на: {new_mode_lightrag}."
+    )

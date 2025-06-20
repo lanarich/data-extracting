@@ -6,25 +6,17 @@ services:
       - /home/user/.cache/huggingface:/root/.cache/huggingface
       - /home/user/.cache/torch_compile:/root/.cache/torch_compile
     restart: unless-stopped
-    network_mode: host 
+    network_mode: host
     shm_size: 16g
     environment:
       HF_TOKEN: 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
-      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch_compile 
+      TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch_compile
     entrypoint: python3 -m sglang.launch_server
     command: >
-      --model-path Qwen/Qwen3-8B
-      --attention-backend flashinfer
-      --host 0.0.0.0
-      --port 30000
-      --context-length 15000
-      --log-level info
-      --show-time-cost
-      --enable-metrics
-      --enable-torch-compile
-      --trust-remote-code
-      --tool-call-parser qwen25
-      --reasoning-parser qwen3
+      --model-path deepseek-ai/DeepSeek-R1-0528-Qwen3-8B --attention-backend
+      flashinfer --host 0.0.0.0 --port 30000 --context-length 15000 --log-level
+      info --show-time-cost --enable-metrics --enable-torch-compile
+      --trust-remote-code --tool-call-parser qwen25 --reasoning-parser qwen3
       --mem-fraction-static 0.85
     ulimits:
       memlock: -1
@@ -44,7 +36,7 @@ services:
               capabilities: [gpu]
 
   postgres:
-    image: pgvector/pgvector:pg14 
+    image: pgvector/pgvector:pg14
     container_name: medical_bot_postgres
     restart: unless-stopped
     environment:
@@ -56,25 +48,33 @@ services:
     volumes:
       - ./postgres_data_on_host:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-admin} -d $${POSTGRES_DB:-medical_bot_db}"]
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U $${POSTGRES_USER:-admin} -d
+          $${POSTGRES_DB:-medical_bot_db}",
+        ]
       interval: 10s
       timeout: 5s
       retries: 5
 
   infinity:
-    image: michaelf34/infinity:0.0.76 
+    image: michaelf34/infinity:0.0.76
     container_name: infinity_rag
     restart: unless-stopped
     ports:
-      - "7997:7997" 
+      - "7997:7997"
     volumes:
-      - /home/user/Projects/data-extracting/.infinity_cache 
+      - /home/user/Projects/data-extracting/.infinity_cache
     command:
       [
         "v2",
-        "--model-id", "sergeyzh/BERTA", 
-        "--device", "cuda", 
-        "--batch-size", "20",
+        "--model-id",
+        "sergeyzh/BERTA",
+        "--device",
+        "cuda",
+        "--batch-size",
+        "20",
       ]
     deploy:
       resources:
@@ -85,13 +85,13 @@ services:
               capabilities: [gpu]
 
   qdrant:
-    image: qdrant/qdrant:v1.14.0 
+    image: qdrant/qdrant:v1.14.0
     container_name: ai_tutor_qdrant
     ports:
-      - "${QDRANT_HTTP_PORT:-6333}:6333" 
-      - "${QDRANT_GRPC_PORT:-6334}:6334" 
+      - "${QDRANT_HTTP_PORT:-6333}:6333"
+      - "${QDRANT_GRPC_PORT:-6334}:6334"
     volumes:
-      - ./.qdrant_storage:/qdrant/storage 
+      - ./.qdrant_storage:/qdrant/storage
     restart: unless-stopped
 
   telegram_bot:

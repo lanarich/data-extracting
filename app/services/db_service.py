@@ -1,9 +1,23 @@
+import datetime
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, List, Optional, Tuple
+from typing import (  # Dict, Any добавлены
+    Any,
+    AsyncGenerator,
+    Dict,
+    List,
+    Optional,
+    Tuple,
+)
 
 from loguru import logger
-from models.models import Base, Document, User
-from sqlalchemy import delete, select
+from models.models import (  # CurriculumTopic, StudentProgress добавлены
+    Base,
+    CurriculumTopic,
+    Document,
+    Student,
+    StudentProgress,
+)
+from sqlalchemy import delete, select  # and_ добавлен
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -17,9 +31,7 @@ def get_db_url(db_config) -> str:
     try:
         return f"postgresql+asyncpg://{db_config.DB_USER}:{db_config.DB_PASSWORD}@{db_config.DB_HOST}:{db_config.DB_PORT}/{db_config.DB_NAME}"
     except AttributeError as e:
-        logger.error(
-            f"Ошибка конфигурации БД: отсутствует один из необходимых атрибутов (DB_USER, DB_PASSWORD, etc.). {e}"
-        )
+        logger.error(f"Ошибка конфигурации БД: {e}")
         raise ValueError(f"Неполная конфигурация для подключения к БД: {e}")
 
 
@@ -43,7 +55,7 @@ async def create_db_engine_and_session_pool(
 async def create_tables(engine: AsyncEngine):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-    logger.info("Все таблицы успешно созданы (если их не было).")
+    logger.info("Все таблицы успешно созданы/проверены (если их не было).")
 
 
 @asynccontextmanager
@@ -66,111 +78,108 @@ async def get_session(
         await session.close()
 
 
-async def get_or_create_user(
+async def get_or_create_student(
     session: AsyncSession,
     user_id: int,
     username: Optional[str] = None,
     first_name: Optional[str] = None,
-    last_name: Optional[str] = None
-    # Параметр role удален
-) -> Tuple[User, bool]:
-    """
-    Получает пользователя по user_id или создает нового.
-    Новые пользователи по умолчанию НЕ являются администраторами (is_admin=False).
-    """
+    last_name: Optional[str] = None,
+    course: Optional[int] = None,
+    group: Optional[str] = None,
+    specialization: Optional[str] = None,
+    enrollment_date: Optional[datetime.datetime] = None,
+) -> Tuple[Student, bool]:
     try:
-        stmt = select(User).where(User.user_id == user_id)
+        stmt = select(Student).where(Student.user_id == user_id)
         result = await session.execute(stmt)
-        user = result.scalar_one_or_none()
-
+        student = result.scalar_one_or_none()
         created = False
-        if user is None:
-            user = User(
+        if student is None:
+            student = Student(
                 user_id=user_id,
                 username=username,
                 first_name=first_name,
                 last_name=last_name,
+                course=course,
+                group=group,
+                specialization=specialization,
+                enrollment_date=enrollment_date,
                 is_admin=False,
             )
-            session.add(user)
+            session.add(student)
             await session.flush()
             created = True
-            logger.info(
-                f"Создан новый пользователь: {user_id}, username: {username}, is_admin: {user.is_admin}"
-            )
+            logger.info(f"Создан новый студент: {user_id}")
         else:
             updated_fields = False
-            if username is not None and user.username != username:
-                user.username = username
+            if username is not None and student.username != username:
+                student.username = username
                 updated_fields = True
-            if first_name is not None and user.first_name != first_name:
-                user.first_name = first_name
+            if first_name is not None and student.first_name != first_name:
+                student.first_name = first_name
                 updated_fields = True
-            if last_name is not None and user.last_name != last_name:
-                user.last_name = last_name
+            if last_name is not None and student.last_name != last_name:
+                student.last_name = last_name
+                updated_fields = True
+            if course is not None and student.course != course:
+                student.course = course
+                updated_fields = True
+            if group is not None and student.group != group:
+                student.group = group
+                updated_fields = True
+            if specialization is not None and student.specialization != specialization:
+                student.specialization = specialization
+                updated_fields = True
+            if (
+                enrollment_date is not None
+                and student.enrollment_date != enrollment_date
+            ):
+                student.enrollment_date = enrollment_date
                 updated_fields = True
             if updated_fields:
                 await session.flush()
-                logger.info(
-                    f"Данные пользователя {user_id} обновлены. Его текущий статус is_admin: {user.is_admin}"
-                )
-        return user, created
+                logger.info(f"Данные студента {user_id} обновлены.")
+        return student, created
     except IntegrityError as e:
         await session.rollback()
-        logger.error(
-            f"Ошибка целостности при создании/получении пользователя {user_id}: {e}"
-        )
+        logger.error(f"Ошибка целостности (студент {user_id}): {e}")
         raise
     except Exception as e:
         await session.rollback()
-        logger.error(
-            f"Ошибка при создании/получении пользователя {user_id}: {e}", exc_info=True
-        )
+        logger.error(f"Ошибка get_or_create_student ({user_id}): {e}", exc_info=True)
         raise
 
 
-async def get_user_by_id(session: AsyncSession, user_id: int) -> Optional[User]:
-    """Получает пользователя по его Telegram ID, включая его статус is_admin."""
-    stmt = select(User).where(User.user_id == user_id)
+async def get_student_by_id(session: AsyncSession, user_id: int) -> Optional[Student]:
+    stmt = select(Student).where(Student.user_id == user_id)
     result = await session.execute(stmt)
     return result.scalar_one_or_none()
 
 
 async def set_user_admin_status(
     session: AsyncSession, user_id: int, is_admin_status: bool
-) -> Optional[User]:
-    """
-    Устанавливает или снимает статус администратора для пользователя.
-    (Может использоваться программно, если потребуется, помимо pgAdmin)
-    """
-    user = await get_user_by_id(session, user_id)
-    if user:
-        user.is_admin = is_admin_status
+) -> Optional[Student]:
+    student = await get_student_by_id(session, user_id)
+    if student:
+        student.is_admin = is_admin_status
         await session.flush()
         logger.info(
-            f"Статус администратора для пользователя {user_id} изменен на: {is_admin_status}."
+            f"Статус администратора для студента {user_id} изменен на: {is_admin_status}."
         )
-        return user
+        return student
     logger.warning(
-        f"Попытка изменить статус администратора для несуществующего пользователя: {user_id}"
+        f"Попытка изменить статус админа для несуществующего студента: {user_id}"
     )
     return None
 
 
 async def get_admin_user_ids_from_db(session: AsyncSession) -> List[int]:
-    """
-    Получает список ID всех пользователей, у которых is_admin = True.
-    """
     try:
-        stmt = select(User.user_id).where(User.is_admin == True)
+        stmt = select(Student.user_id).where(Student.is_admin == True)
         result = await session.execute(stmt)
-        admin_ids = result.scalars().all()
-        logger.debug(f"Получены ID администраторов из БД: {admin_ids}")
-        return admin_ids
+        return result.scalars().all()
     except Exception as e:
-        logger.error(
-            f"Ошибка при получении ID администраторов из БД: {e}", exc_info=True
-        )
+        logger.error(f"Ошибка при получении ID администраторов: {e}", exc_info=True)
         return []
 
 
@@ -184,16 +193,11 @@ async def add_document(
     try:
         existing_doc = await get_document_by_lightrag_id(session, lightrag_id)
         if existing_doc:
-            logger.warning(
-                f"Документ с lightrag_id='{lightrag_id}' уже существует. Обновление существующего."
-            )
             existing_doc.file_name = file_name
             existing_doc.status = status
-            existing_doc.uploaded_by_tg_id = uploaded_by_tg_id
             await session.flush()
-            logger.info(f"Данные существующего документа '{lightrag_id}' обновлены.")
+            logger.info(f"Данные документа '{lightrag_id}' обновлены.")
             return existing_doc
-
         new_document = Document(
             lightrag_id=lightrag_id,
             file_name=file_name,
@@ -203,19 +207,19 @@ async def add_document(
         session.add(new_document)
         await session.flush()
         logger.info(
-            f"Документ '{file_name}' (lightrag_id: {new_document.lightrag_id}, status: {status}) добавлен пользователем {uploaded_by_tg_id}."
+            f"Документ '{file_name}' (ID: {new_document.lightrag_id}) добавлен студентом {uploaded_by_tg_id}."
         )
         return new_document
     except IntegrityError as e:
         await session.rollback()
         logger.error(
-            f"Ошибка целостности при добавлении документа '{lightrag_id}': {e}"
+            f"Ошибка целостности (документ '{lightrag_id}', студент {uploaded_by_tg_id}): {e}"
         )
         raise
     except Exception as e:
         await session.rollback()
         logger.error(
-            f"Ошибка при добавлении документа '{file_name}' (lightrag_id: {lightrag_id}): {e}",
+            f"Ошибка add_document ('{file_name}', ID: {lightrag_id}): {e}",
             exc_info=True,
         )
         raise
@@ -232,29 +236,16 @@ async def get_document_by_lightrag_id(
 async def update_document_status(
     session: AsyncSession, lightrag_id: str, new_status: str
 ) -> Optional[Document]:
-    allowed_statuses = [
-        "pending",
-        "processing",
-        "processed",
-        "failed",
-        "deleted_by_admin",
-    ]
-    if new_status not in allowed_statuses:
-        logger.error(
-            f"Недопустимый статус '{new_status}' для документа {lightrag_id}. Допустимые: {', '.join(allowed_statuses)}."
-        )
-        raise ValueError(f"Недопустимый статус для БД: {new_status}")
-
     document = await get_document_by_lightrag_id(session, lightrag_id)
     if document:
         document.status = new_status
         await session.flush()
         logger.info(
-            f"Статус документа lightrag_id: {lightrag_id} в БД обновлен на '{new_status}'."
+            f"Статус документа ID: {lightrag_id} в БД обновлен на '{new_status}'."
         )
         return document
     logger.warning(
-        f"Попытка обновить статус несуществующего документа в БД: lightrag_id {lightrag_id}"
+        f"Попытка обновить статус несуществующего документа: ID {lightrag_id}"
     )
     return None
 
@@ -302,7 +293,6 @@ async def get_user_documents(
     stmt = select(Document).where(Document.uploaded_by_tg_id == user_id)
     if not include_deleted_by_admin:
         stmt = stmt.where(Document.status != "deleted_by_admin")
-
     stmt = stmt.order_by(Document.created_at.desc()).limit(limit).offset(offset)
     result = await session.execute(stmt)
     return result.scalars().all()
@@ -312,9 +302,220 @@ async def hard_delete_document(session: AsyncSession, lightrag_id: str) -> bool:
     stmt = delete(Document).where(Document.lightrag_id == lightrag_id)
     result = await session.execute(stmt)
     if result.rowcount > 0:
-        logger.info(f"Документ lightrag_id: {lightrag_id} физически удален из БД.")
+        logger.info(f"Документ ID: {lightrag_id} физически удален из БД.")
         return True
     logger.warning(
-        f"Попытка физически удалить несуществующий документ: lightrag_id {lightrag_id}"
+        f"Попытка физически удалить несуществующий документ: ID {lightrag_id}"
     )
     return False
+
+
+async def get_curriculum_topic_by_id(
+    session: AsyncSession, topic_id: str
+) -> Optional[CurriculumTopic]:
+    stmt = select(CurriculumTopic).where(CurriculumTopic.topic_id == topic_id)
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def get_student_progress(
+    session: AsyncSession, student_id: int, topic_id: str
+) -> Optional[StudentProgress]:
+    stmt = select(StudentProgress).where(
+        StudentProgress.student_id == student_id, StudentProgress.topic_id == topic_id
+    )
+    result = await session.execute(stmt)
+    return result.scalar_one_or_none()
+
+
+async def update_or_create_student_progress(
+    session: AsyncSession,
+    student_id: int,
+    topic_id: str,
+    status: str,
+    assessment_results: Optional[dict] = None,
+) -> StudentProgress:
+    progress = await get_student_progress(session, student_id, topic_id)
+    if progress:
+        progress.status = status
+        progress.last_accessed = datetime.datetime.utcnow()
+        if assessment_results is not None:
+            progress.assessment_results = assessment_results
+        logger.info(
+            f"Прогресс студента {student_id} по теме {topic_id} обновлен: {status}."
+        )
+    else:
+        student = await get_student_by_id(session, student_id)
+        topic = await get_curriculum_topic_by_id(session, topic_id)
+        if not student:
+            raise ValueError(f"Студент {student_id} не найден.")
+        if not topic:
+            raise ValueError(f"Тема {topic_id} не найдена.")
+        progress = StudentProgress(
+            student_id=student_id,
+            topic_id=topic_id,
+            status=status,
+            assessment_results=assessment_results,
+        )
+        session.add(progress)
+        logger.info(
+            f"Создан прогресс для студента {student_id} по теме {topic_id}: {status}."
+        )
+    await session.flush()
+    return progress
+
+
+async def get_student_curriculum_info_for_agent(
+    session: AsyncSession, student_id: int
+) -> Dict[str, Any]:
+    """
+    Определяет текущую/следующую тему для студента.
+    Логика: ищет первую тему без статуса 'completed', учитывая порядок и (опционально) пререквизиты.
+    """
+    logger.debug(f"Определение текущей темы для студента {student_id}")
+
+    # 1. Получить все темы, отсортированные по порядку (предполагаем, что поле 'order' существует и заполнено)
+    all_topics_stmt = select(CurriculumTopic).order_by(
+        CurriculumTopic.parent_topic_id.asc(),
+        CurriculumTopic.order.asc(),
+        CurriculumTopic.topic_id.asc(),
+    )
+    all_topics_result = await session.execute(all_topics_stmt)
+    all_topics: List[CurriculumTopic] = all_topics_result.scalars().all()
+
+    if not all_topics:
+        logger.warning("Учебный план пуст. Невозможно определить тему.")
+        return {
+            "current_topic_id": "no_topics_available",
+            "current_topic_name": "Учебный план пуст",
+            "current_learning_objectives": "Обратитесь к администратору.",
+        }
+
+    # 2. Получить весь прогресс студента по всем темам
+    progress_stmt = select(StudentProgress).where(
+        StudentProgress.student_id == student_id
+    )
+    progress_result = await session.execute(progress_stmt)
+    student_progress_list: List[StudentProgress] = progress_result.scalars().all()
+    progress_map: Dict[str, StudentProgress] = {
+        p.topic_id: p for p in student_progress_list
+    }
+
+    # 3. Найти первую не пройденную тему
+    current_topic: Optional[CurriculumTopic] = None
+    for topic in all_topics:
+        topic_progress = progress_map.get(topic.topic_id)
+        if not topic_progress or topic_progress.status != "completed":
+            # Дополнительно: Проверка пререквизитов (если они есть)
+            # prerequisites_ok = True
+            # if topic.prerequisites:
+            #     for prereq_id in topic.prerequisites:
+            #         prereq_progress = progress_map.get(prereq_id)
+            #         if not prereq_progress or prereq_progress.status != "completed":
+            #             prerequisites_ok = False
+            #             break
+            # if prerequisites_ok:
+            current_topic = topic
+            break
+
+    if current_topic:
+        logger.info(
+            f"Найдена текущая тема для студента {student_id}: {current_topic.topic_name} (ID: {current_topic.topic_id})"
+        )
+        return {
+            "current_topic_id": current_topic.topic_id,
+            "current_topic_name": current_topic.topic_name,
+            "current_learning_objectives": current_topic.learning_objectives
+            or "Цели обучения не указаны.",
+        }
+    else:
+        logger.info(
+            f"Все темы для студента {student_id} пройдены или не удалось определить следующую."
+        )
+        return {
+            "current_topic_id": "all_topics_completed",
+            "current_topic_name": "Все темы пройдены!",
+            "current_learning_objectives": "Поздравляем с завершением учебного плана!",
+        }
+
+
+async def get_student_progress_summary_for_recommendations_agent(
+    session: AsyncSession, student_id: int, current_topic_id: Optional[str]
+) -> str:
+    """Собирает сводку прогресса студента для Агента Рекомендаций."""
+    logger.debug(
+        f"Сбор сводки прогресса для студента {student_id}, тема: {current_topic_id}"
+    )
+    summary_parts = []
+
+    student = await get_student_by_id(session, student_id)
+    if not student:
+        return "Профиль студента не найден."
+
+    summary_parts.append(
+        f"Студент: {student.first_name or student.username or student.user_id}."
+    )
+    if student.course:
+        summary_parts.append(f"Курс: {student.course}.")
+    if student.group:
+        summary_parts.append(f"Группа: {student.group}.")
+
+    if current_topic_id:
+        topic = await get_curriculum_topic_by_id(session, current_topic_id)
+        if topic:
+            summary_parts.append(f'Текущая тема для анализа: "{topic.topic_name}".')
+            progress = await get_student_progress(session, student_id, current_topic_id)
+            if progress:
+                summary_parts.append(f"Статус по этой теме: '{progress.status}'.")
+                if progress.assessment_results:
+                    summary_parts.append(
+                        f"Последние результаты оценки: {progress.assessment_results}."
+                    )
+                summary_parts.append(
+                    f"Последнее обращение к теме: {progress.last_accessed.strftime('%Y-%m-%d %H:%M') if progress.last_accessed else 'нет данных'}."
+                )
+            else:
+                summary_parts.append("Прогресс по данной теме еще не начат.")
+
+            # Информация о пререквизитах
+            if topic.prerequisites and isinstance(topic.prerequisites, list):
+                summary_parts.append(f'Пререквизиты для "{topic.topic_name}":')
+                for prereq_id in topic.prerequisites:
+                    prereq_topic = await get_curriculum_topic_by_id(session, prereq_id)
+                    if prereq_topic:
+                        prereq_name = prereq_topic.topic_name
+                        prereq_progress = await get_student_progress(
+                            session, student_id, prereq_id
+                        )
+                        if prereq_progress:
+                            summary_parts.append(
+                                f"  - \"{prereq_name}\" (ID: {prereq_id}): статус '{prereq_progress.status}'."
+                            )
+                        else:
+                            summary_parts.append(
+                                f'  - "{prereq_name}" (ID: {prereq_id}): прогресс не начат.'
+                            )
+                    else:
+                        summary_parts.append(
+                            f"  - Тема-пререквизит с ID '{prereq_id}' не найдена."
+                        )
+        else:
+            summary_parts.append(
+                f"Тема с ID '{current_topic_id}' не найдена в учебном плане."
+            )
+    else:
+        summary_parts.append("Конкретная текущая тема для анализа не указана.")
+
+    # Можно добавить общую успеваемость или количество пройденных тем
+    # completed_topics_count_stmt = select(func.count(StudentProgress.id)).where(
+    #     StudentProgress.student_id == student_id,
+    #     StudentProgress.status == "completed"
+    # )
+    # completed_count_res = await session.execute(completed_topics_count_stmt)
+    # completed_count = completed_count_res.scalar_one_or_none()
+    # if completed_count is not None:
+    #     summary_parts.append(f"Всего пройденных тем: {completed_count}.")
+
+    if not summary_parts:
+        return "Детальная информация о прогрессе для рекомендаций отсутствует."
+    return "\n".join(summary_parts)

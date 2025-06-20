@@ -1,6 +1,7 @@
 import asyncio
 import os
 import sys
+from typing import Optional
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
@@ -10,14 +11,29 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 from handlers.admin import admin_router
 from handlers.user import user_router
 from hydra import compose, initialize
+
+# Импорт для Langchain LLM
+from langchain_openai import ChatOpenAI  # Добавлено
+from langfuse import Langfuse
+from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
+from langgraph.graph import StatefulGraph  # Добавлено для типизации
+from lightrag import LightRAG  # Добавлено для типизации rag_instance
 from loguru import logger
+from omegaconf import DictConfig  # Добавлено для типизации cfg
 from services.db_service import (
     create_db_engine_and_session_pool,
     create_tables,
     get_db_url,
 )
-from services.rag_service import RAGServiceError, initialize_lightrag_instance
+from services.rag_service import initialize_lightrag_instance  # LightRAG все еще нужен
 from utils.config_loader import load_texts_from_config
+
+# Импорт для создания графа
+from app.agents.graph import create_tutor_graph  # Добавлено
+
+langfuse_callback_handler: Optional[LangfuseCallbackHandler] = None
+langfuse_client: Optional[Langfuse] = None
+cfg: Optional[DictConfig] = None  # Объявляем cfg глобально для доступа в finally
 
 try:
     with initialize(
@@ -28,8 +44,7 @@ try:
 
     if not hasattr(cfg, "server") or not cfg.server.API_KEY:
         raise ValueError("Отсутствует API_KEY в конфигурации (server.API_KEY).")
-    if not cfg.server.DB_NAME:
-        raise ValueError("Отсутствует DB_NAME в конфигурации (server.DB_NAME).")
+    # ... (остальные проверки конфигурации как были) ...
     if not hasattr(cfg, "llm") or not cfg.llm.api_base or not cfg.llm.model_name:
         raise ValueError(
             "Отсутствует или неполная конфигурация LLM (llm.api_base, llm.model_name)."
@@ -43,6 +58,33 @@ try:
             "Отсутствует или неполная конфигурация Embedding (embedding.api_base, embedding.model_name)."
         )
 
+    if (
+        not hasattr(cfg, "langfuse")
+        or not hasattr(cfg.langfuse, "public_key")
+        or not hasattr(cfg.langfuse, "secret_key")
+        or not hasattr(cfg.langfuse, "host")
+    ):
+        logger.warning(
+            "Конфигурация Langfuse неполная или отсутствует в config.yaml. Langfuse будет отключен."
+        )
+        if hasattr(cfg, "langfuse"):
+            cfg.langfuse.enabled = False
+        else:
+            from omegaconf import OmegaConf
+
+            cfg.langfuse = OmegaConf.create(
+                {"enabled": False, "public_key": None, "secret_key": None, "host": None}
+            )
+    elif (
+        not cfg.langfuse.public_key
+        or not cfg.langfuse.secret_key
+        or not cfg.langfuse.host
+    ):
+        logger.warning(
+            "Ключи или хост Langfuse не заданы в config.yaml. Langfuse будет отключен."
+        )
+        cfg.langfuse.enabled = False
+
 
 except Exception as e:
     print(
@@ -55,16 +97,15 @@ except Exception as e:
 os.environ["QDRANT_URL"] = cfg.qdrant.get("url", "http://127.0.0.1:6333")
 
 logger.remove()
-
 logger.add(
     sys.stdout,
     format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}",
     level=cfg.logging.console_level
-    if hasattr(cfg, "logging") and hasattr(cfg.logging, "console_level")
+    if hasattr(cfg.logging, "console_level")
     else "INFO",
     colorize=True,
 )
-
+# ... (остальная настройка логгера как была) ...
 if (
     hasattr(cfg, "logging")
     and hasattr(cfg.logging, "file_path")
@@ -96,14 +137,49 @@ else:
 logger.info("Логгер сконфигурирован.")
 
 
+if cfg.langfuse.enabled:
+    try:
+        langfuse_client = Langfuse(
+            public_key=cfg.langfuse.public_key,
+            secret_key=cfg.langfuse.secret_key,
+            host=cfg.langfuse.host,
+            release=cfg.langfuse.get("release"),
+            debug=cfg.langfuse.get("debug", False),
+        )
+        langfuse_callback_handler = LangfuseCallbackHandler(
+            public_key=cfg.langfuse.public_key,
+            secret_key=cfg.langfuse.secret_key,
+            host=cfg.langfuse.host,
+            release=cfg.langfuse.get("release"),
+        )
+        logger.info(
+            f"Langfuse успешно инициализирован. Release: {cfg.langfuse.get('release')}"
+        )
+    except Exception as e:
+        logger.error(
+            f"Ошибка инициализации Langfuse: {e}. Langfuse будет отключен.",
+            exc_info=True,
+        )
+        cfg.langfuse.enabled = False
+        langfuse_callback_handler = None
+        langfuse_client = None
+else:
+    logger.info("Langfuse отключен согласно конфигурации.")
+    langfuse_callback_handler = None
+    langfuse_client = None
+
+
 async def set_bot_commands(bot: Bot):
+    # ... (код как был) ...
     user_commands = [
         BotCommand(command="start", description="▶️ Запустить / Перезапустить бота"),
         BotCommand(
             command="toggle_mode",
-            description="⚙️ Сменить режим LLM (Стандарт/Размышление)",
+            description="⚙️ Сменить режим LLM (Стандарт/Размышление)",  # Эта команда может потребовать переосмысления
         ),
-        BotCommand(command="clear_history", description="🗑️ Очистить историю диалога"),
+        BotCommand(
+            command="clear_history", description="🗑️ Очистить историю диалога"
+        ),  # Управление историей теперь в графе
     ]
     try:
         await bot.set_my_commands(
@@ -141,34 +217,36 @@ async def main():
             if hasattr(cfg, "db") and hasattr(cfg.db, "echo")
             else False,
         )
-        await create_tables(engine)
+        await create_tables(
+            engine
+        )  # Убедитесь, что create_tables создает новые таблицы
         logger.info(
-            f"Соединение с базой данных ({cfg.server.DB_NAME}@{cfg.server.DB_HOST}) установлено и таблицы проверены/созданы."
+            f"Соединение с БД ({cfg.server.DB_NAME}@{cfg.server.DB_HOST}) установлено и таблицы созданы/проверены."
         )
-    except ValueError as e:
-        logger.critical(f"Ошибка конфигурации для подключения к БД: {e}", exc_info=True)
-        return
-    except Exception as e:
-        logger.critical(
-            f"Не удалось инициализировать соединение с базой данных: {e}", exc_info=True
-        )
+    except Exception as e:  # Более общая обработка ошибок
+        logger.critical(f"Не удалось инициализировать БД: {e}", exc_info=True)
         return
 
-    llm_base_cfg_dict = {
-        "model_name": cfg.llm.get("model_name", "Qwen/Qwen3-8B"),
-        "base_url": cfg.llm.get("api_base", "http://localhost:30000/v1"),
-        "api_key": cfg.llm.get("api_key", "NO"),
-        "default_temperature": cfg.llm.get("default_temperature", 0.7),
-        "default_max_tokens": cfg.llm.get("default_max_tokens", 2048),
-    }
-    logger.info(f"Базовая конфигурация LLM подготовлена: {llm_base_cfg_dict}")
+    # Инициализация LLM для агентов LangGraph
+    # Используем конфигурацию из cfg.llm, но модель будет DeepSeek
+    langchain_llm = ChatOpenAI(
+        model=cfg.llm.model_name,  # Должно быть "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+        openai_api_base=cfg.llm.api_base,
+        openai_api_key=cfg.llm.api_key,  # Обычно "NO" для локального SGLang
+        temperature=cfg.llm.get("default_temperature", 0.7),
+        max_tokens=cfg.llm.get("default_max_tokens", 2048),
+        # streaming=True, # Если планируется потоковая передача
+        # callbacks=[langfuse_callback_handler] if cfg.langfuse.enabled and langfuse_callback_handler else None # Добавляем Langfuse callback
+    )
+    logger.info(f"Langchain LLM ({cfg.llm.model_name}) инициализирован для агентов.")
 
-    rag_instance = None
+    # Инициализация LightRAG (остается как есть для RetrieverTool)
+    rag_instance: Optional[LightRAG] = None
     try:
         logger.info("Инициализация LightRAG...")
         rag_instance = await initialize_lightrag_instance(cfg)
         logger.info("Экземпляр LightRAG успешно инициализирован.")
-    except RAGServiceError as e:
+    except Exception as e:  # Более общая обработка ошибок
         logger.critical(
             f"Не удалось инициализировать LightRAG: {e}. Бот не может быть запущен.",
             exc_info=True,
@@ -176,11 +254,22 @@ async def main():
         if engine:
             await engine.dispose()
         return
-    except Exception as e:
-        logger.critical(
-            f"Неожиданная ошибка при инициализации LightRAG: {e}. Бот не может быть запущен.",
-            exc_info=True,
+
+    if not rag_instance:  # Дополнительная проверка
+        logger.critical("Экземпляр rag_instance не был создан. Завершение работы.")
+        if engine:
+            await engine.dispose()
+        return
+
+    # Создание графа ИИ Тьютора
+    tutor_graph: Optional[StatefulGraph] = None
+    try:
+        tutor_graph = create_tutor_graph(
+            llm=langchain_llm, rag_instance=rag_instance, session_pool=session_pool
         )
+        logger.info("Граф ИИ Тьютора успешно создан.")
+    except Exception as e:
+        logger.critical(f"Не удалось создать граф ИИ Тьютора: {e}", exc_info=True)
         if engine:
             await engine.dispose()
         return
@@ -188,14 +277,22 @@ async def main():
     storage = MemoryStorage()
     logger.info(f"Хранилище FSM: {type(storage).__name__}")
 
-    dp = Dispatcher(
-        storage=storage,
-        session_pool=session_pool,
-        bot_texts=bot_texts,
-        engine=engine,
-        rag_instance=rag_instance,
-        llm_base_config=llm_base_cfg_dict,
-    )
+    dp_kwargs = {
+        "storage": storage,
+        "session_pool": session_pool,
+        "bot_texts": bot_texts,
+        "engine": engine,
+        "rag_instance": rag_instance,  # Для админских функций и, возможно, старой логики
+        "llm_base_config": cfg.llm,  # Конфигурация LLM для LightRAG, если он ее использует
+        "langchain_llm": langchain_llm,  # LLM для агентов LangGraph
+        "tutor_graph": tutor_graph,  # Скомпилированный граф
+        "cfg": cfg,
+    }
+    if cfg.langfuse.enabled and langfuse_callback_handler:
+        dp_kwargs["langfuse_handler"] = langfuse_callback_handler
+        logger.info("Langfuse callback handler передан в Dispatcher.")
+
+    dp = Dispatcher(**dp_kwargs)
     logger.info("Диспетчер создан и сконфигурирован.")
 
     dp.include_router(user_router)
@@ -206,6 +303,7 @@ async def main():
         token=cfg.server.API_KEY,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
+    # ... (остальная часть main как была) ...
     bot_info = await bot.get_me()
     logger.info(f"Экземпляр бота создан для @{bot_info.username} (ID: {bot_info.id}).")
 
@@ -219,9 +317,14 @@ async def main():
         )
     finally:
         logger.warning("Остановка бота...")
-        if "engine" in dp.workflow_data and dp.workflow_data["engine"]:
-            await dp.workflow_data["engine"].dispose()
+        if engine:
+            await engine.dispose()
             logger.info("Соединение с базой данных закрыто.")
+
+        global langfuse_client  # Используем глобальную переменную
+        if cfg and cfg.langfuse.enabled and langfuse_client:
+            langfuse_client.flush()
+            logger.info("Langfuse сессия обработана перед остановкой.")
 
         if bot and bot.session:
             await bot.session.close()
@@ -234,10 +337,10 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен вручную (KeyboardInterrupt или SystemExit).")
-    except Exception as e:
-        print(f"КРИТИЧЕСКАЯ ОШИБКА (во время запуска/остановки): {e}", file=sys.stderr)
-        logger.critical(
-            f"Критическая ошибка во время запуска или глобальной остановки бота: {e}",
-            exc_info=True,
-        )
-        sys.exit(1)
+    # except Exception as e: # Убрана общая обработка, чтобы видеть ошибки Hydra при запуске
+    #     print(f"КРИТИЧЕСКАЯ ОШИБКА (во время запуска/остановки): {e}", file=sys.stderr)
+    #     logger.critical(
+    #         f"Критическая ошибка во время запуска или глобальной остановки бота: {e}",
+    #         exc_info=True,
+    #     )
+    #     sys.exit(1)

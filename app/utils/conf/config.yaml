@@ -11,14 +11,12 @@ logging:
   compression: "zip"
 
 application:
-  name: "Medical University Bot"
+  name: "AI Tutor Bot"
   version: "0.1.0"
-  admin_ids:
-    - 6848724751
 
 llm:
   api_base: "http://127.0.0.1:30000/v1"
-  model_name: "Qwen/Qwen3-8B"
+  model_name: "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
   api_key: "NO"
   default_temperature: 0.7
   default_max_tokens: 2048
@@ -45,3 +43,11 @@ rag_settings:
   addon_params:
     language: "Русский"
     insert_batch_size: 20
+
+langfuse:
+  public_key: "YOUR_LANGFUSE_PUBLIC_KEY" # Замените на ваш ключ
+  secret_key: "YOUR_LANGFUSE_SECRET_KEY" # Замените на ваш ключ
+  host: "" # Или ваш локальный хост, например "http://localhost:3000"
+  enabled: true # Позволяет включать/выключать интеграцию
+  release: ${application.version} # Можно использовать версию приложения для релизов в Langfuse
+  # debug: false # Включить для отладки Langfuse SDK
