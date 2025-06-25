@@ -4,6 +4,7 @@ from aiogram import Bot, F, Router, types
 from aiogram.enums import ChatAction
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
 from langgraph.graph import StatefulGraph
 from loguru import logger
@@ -17,6 +18,15 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from app.agents.state import TutorGraphState
 
 user_router = Router(name="user_handlers")
+
+
+class Registration(StatesGroup):
+    """Состояния диалога регистрации студента."""
+
+    waiting_for_full_name = State()
+    waiting_for_direction = State()
+    waiting_for_program = State()
+    waiting_for_course = State()
 
 
 async def handle_graph_output(
@@ -88,6 +98,301 @@ async def handle_graph_output(
         )
 
 
+async def start_tutor_session(
+    message: types.Message,
+    user: types.User,
+    bot: Bot,
+    bot_texts: dict,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
+) -> None:
+    """Запускает LangGraph-тьютор после регистрации."""
+    initial_graph_input = TutorGraphState(
+        student_id=user.id,
+        student_profile=None,
+        input_query=None,
+        chat_history=[],
+        current_topic_id=None,
+        current_topic_name=None,
+        current_learning_objectives=None,
+        retrieved_context=None,
+        assessment_question=None,
+        student_answer=None,
+        assessment_feedback=None,
+        recommendations=None,
+        error_message=None,
+    )
+
+    try:
+        await message.answer(
+            bot_texts.get("user_messages", {}).get(
+                "start_graph_processing",
+                "Инициализация вашего учебного плана...",
+            )
+        )
+        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
+
+        config_for_graph_call = {"configurable": {"thread_id": str(user.id)}}
+        if cfg.langfuse.enabled and langfuse_handler:
+            config_for_graph_call["callbacks"] = [langfuse_handler]
+            logger.info(
+                f"Langfuse callback handler добавлен для вызова графа пользователя {user.id}"
+            )
+
+        final_output_state = None
+        async for event_state in tutor_graph.astream(
+            initial_graph_input,
+            config=config_for_graph_call,
+            stream_mode="values",
+        ):
+            final_output_state = event_state
+
+        if final_output_state:
+            await handle_graph_output(final_output_state, message, bot_texts)
+        else:
+            logger.error(
+                f"Граф не вернул финального состояния для пользователя {user.id} при /start."
+            )
+            await message.answer(
+                bot_texts.get("errors", {}).get(
+                    "error_graph_start_failed",
+                    "Не удалось начать сессию.",
+                )
+            )
+
+    except Exception as e:
+        logger.error(
+            f"Ошибка при первом вызове графа для пользователя {user.id}: {e}",
+            exc_info=True,
+        )
+        await message.answer(
+            bot_texts.get("errors", {}).get("error_generic", "Произошла ошибка."),
+        )
+
+
+@user_router.message(Registration.waiting_for_full_name)
+async def process_full_name(
+    message: types.Message,
+    state: FSMContext,
+    session_pool: async_sessionmaker[AsyncSession],
+    bot_texts: dict,
+    bot: Bot,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
+):
+    user = message.from_user
+    if not user or not message.text:
+        return
+    full_name = message.text.strip()
+    async with get_session(session_pool) as db_session:
+        student, _ = await get_or_create_student(
+            session=db_session,
+            user_id=user.id,
+            full_name=full_name,
+        )
+
+    if not student.direction:
+        await state.set_state(Registration.waiting_for_direction)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_direction",
+                "Укажите направление обучения",
+            )
+        )
+        return
+    if not student.program:
+        await state.set_state(Registration.waiting_for_program)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_program",
+                "Укажите образовательную программу",
+            )
+        )
+        return
+    if student.course is None:
+        await state.set_state(Registration.waiting_for_course)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_course",
+                "На каком курсе вы обучаетесь?",
+            )
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        bot_texts.get("registration", {}).get(
+            "registration_complete",
+            "Регистрация завершена.",
+        )
+    )
+    await start_tutor_session(
+        message,
+        user,
+        bot,
+        bot_texts,
+        tutor_graph,
+        cfg,
+        langfuse_handler,
+    )
+
+
+@user_router.message(Registration.waiting_for_direction)
+async def process_direction(
+    message: types.Message,
+    state: FSMContext,
+    session_pool: async_sessionmaker[AsyncSession],
+    bot_texts: dict,
+    bot: Bot,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
+):
+    user = message.from_user
+    if not user or not message.text:
+        return
+    direction = message.text.strip()
+    async with get_session(session_pool) as db_session:
+        student, _ = await get_or_create_student(
+            session=db_session,
+            user_id=user.id,
+            direction=direction,
+        )
+
+    if not student.program:
+        await state.set_state(Registration.waiting_for_program)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_program",
+                "Укажите образовательную программу",
+            )
+        )
+        return
+    if student.course is None:
+        await state.set_state(Registration.waiting_for_course)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_course",
+                "На каком курсе вы обучаетесь?",
+            )
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        bot_texts.get("registration", {}).get(
+            "registration_complete",
+            "Регистрация завершена.",
+        )
+    )
+    await start_tutor_session(
+        message,
+        user,
+        bot,
+        bot_texts,
+        tutor_graph,
+        cfg,
+        langfuse_handler,
+    )
+
+
+@user_router.message(Registration.waiting_for_program)
+async def process_program(
+    message: types.Message,
+    state: FSMContext,
+    session_pool: async_sessionmaker[AsyncSession],
+    bot_texts: dict,
+    bot: Bot,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
+):
+    user = message.from_user
+    if not user or not message.text:
+        return
+    program = message.text.strip()
+    async with get_session(session_pool) as db_session:
+        student, _ = await get_or_create_student(
+            session=db_session,
+            user_id=user.id,
+            program=program,
+        )
+
+    if student.course is None:
+        await state.set_state(Registration.waiting_for_course)
+        await message.answer(
+            bot_texts.get("registration", {}).get(
+                "ask_course",
+                "На каком курсе вы обучаетесь?",
+            )
+        )
+        return
+
+    await state.clear()
+    await message.answer(
+        bot_texts.get("registration", {}).get(
+            "registration_complete",
+            "Регистрация завершена.",
+        )
+    )
+    await start_tutor_session(
+        message,
+        user,
+        bot,
+        bot_texts,
+        tutor_graph,
+        cfg,
+        langfuse_handler,
+    )
+
+
+@user_router.message(Registration.waiting_for_course)
+async def process_course(
+    message: types.Message,
+    state: FSMContext,
+    session_pool: async_sessionmaker[AsyncSession],
+    bot_texts: dict,
+    bot: Bot,
+    tutor_graph: StatefulGraph,
+    cfg: DictConfig,
+    langfuse_handler: Optional[LangfuseCallbackHandler] = None,
+):
+    user = message.from_user
+    if not user or not message.text:
+        return
+    try:
+        course = int(message.text.strip())
+    except ValueError:
+        await message.answer(bot_texts.get("registration", {}).get("ask_course", "На каком курсе вы обучаетесь?"))
+        return
+
+    async with get_session(session_pool) as db_session:
+        await get_or_create_student(
+            session=db_session,
+            user_id=user.id,
+            course=course,
+        )
+
+    await state.clear()
+    await message.answer(
+        bot_texts.get("registration", {}).get(
+            "registration_complete",
+            "Регистрация завершена.",
+        )
+    )
+    await start_tutor_session(
+        message,
+        user,
+        bot,
+        bot_texts,
+        tutor_graph,
+        cfg,
+        langfuse_handler,
+    )
+
+
 @user_router.message(CommandStart())
 async def handle_start_command(
     message: types.Message,
@@ -124,73 +429,34 @@ async def handle_start_command(
         else:
             logger.info(f"Студент {db_student_model.user_id} уже существует.")
 
-    initial_graph_input = TutorGraphState(
-        student_id=user.id,
-        student_profile=None,
-        input_query=None,
-        chat_history=[],
-        current_topic_id=None,
-        current_topic_name=None,
-        current_learning_objectives=None,
-        retrieved_context=None,
-        assessment_question=None,
-        student_answer=None,
-        assessment_feedback=None,
-        recommendations=None,
-        error_message=None,
+    # Запуск процесса регистрации, если отсутствуют обязательные поля
+    if not db_student_model.full_name:
+        await state.set_state(Registration.waiting_for_full_name)
+        await message.answer(bot_texts.get("registration", {}).get("ask_full_name", "Укажите ваше полное имя"))
+        return
+    if not db_student_model.direction:
+        await state.set_state(Registration.waiting_for_direction)
+        await message.answer(bot_texts.get("registration", {}).get("ask_direction", "Укажите направление обучения"))
+        return
+    if not db_student_model.program:
+        await state.set_state(Registration.waiting_for_program)
+        await message.answer(bot_texts.get("registration", {}).get("ask_program", "Укажите образовательную программу"))
+        return
+    if db_student_model.course is None:
+        await state.set_state(Registration.waiting_for_course)
+        await message.answer(bot_texts.get("registration", {}).get("ask_course", "На каком курсе вы обучаетесь?"))
+        return
+
+    await start_tutor_session(
+        message,
+        user,
+        bot,
+        bot_texts,
+        tutor_graph,
+        cfg,
+        langfuse_handler,
     )
 
-    try:
-        await message.answer(
-            bot_texts.get("user_messages", {}).get(
-                "start_graph_processing", "Инициализация вашего учебного плана..."
-            )
-        )
-        await bot.send_chat_action(chat_id=message.chat.id, action=ChatAction.TYPING)
-
-        config_for_graph_call = {"configurable": {"thread_id": str(user.id)}}
-        if cfg.langfuse.enabled and langfuse_handler:
-            # Langfuse трейсинг для вызовов LangChain компонентов внутри графа
-            config_for_graph_call["callbacks"] = [langfuse_handler]
-            logger.info(
-                f"Langfuse callback handler добавлен для вызова графа пользователя {user.id}"
-            )
-
-        final_output_state = None
-        # Используем .invoke() для получения только финального состояния после всех шагов,
-        # если граф спроектирован так, чтобы выдать все необходимое за один "проход" до первого END (вопроса студенту)
-        # Или astream, если хотим обрабатывать промежуточные ответы/действия
-
-        # output = await tutor_graph.ainvoke(initial_graph_input, config=config_for_graph_call)
-        # final_output_state = output # ainvoke возвращает финальное состояние
-
-        # Используем astream, если граф может остановиться на полпути (например, задать вопрос)
-        # и мы хотим получить это состояние. stream_mode="values" дает полное состояние на каждом шаге.
-        async for event_state in tutor_graph.astream(
-            initial_graph_input, config=config_for_graph_call, stream_mode="values"
-        ):
-            final_output_state = event_state
-
-        if final_output_state:
-            await handle_graph_output(final_output_state, message, bot_texts)
-        else:
-            logger.error(
-                f"Граф не вернул финального состояния для пользователя {user.id} при /start."
-            )
-            await message.answer(
-                bot_texts.get("errors", {}).get(
-                    "error_graph_start_failed", "Не удалось начать сессию."
-                )
-            )
-
-    except Exception as e:
-        logger.error(
-            f"Ошибка при первом вызове графа для пользователя {user.id}: {e}",
-            exc_info=True,
-        )
-        await message.answer(
-            bot_texts.get("errors", {}).get("error_generic", "Произошла ошибка.")
-        )
 
 
 @user_router.message(

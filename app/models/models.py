@@ -53,6 +53,11 @@ class Student(Base, TimestampMixin):  # Переименовано из User
     first_name = Column(String, nullable=True, comment="Имя студента")
     last_name = Column(String, nullable=True, comment="Фамилия студента")
 
+    middle_name = Column(String, nullable=True, comment="Отчество студента")
+    full_name = Column(String, nullable=True, comment="Полное имя студента")
+    program = Column(String, nullable=True, comment="Образовательная программа")
+    direction = Column(String, nullable=True, comment="Направление обучения")
+
     # Новые поля для студента
     course = Column(Integer, nullable=True, comment="Курс обучения")
     group = Column(String, nullable=True, comment="Номер группы")
