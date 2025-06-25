@@ -167,7 +167,7 @@ class CurriculumTopic(Base, TimestampMixin):
         index=True,
         comment="ID документа-источника контента",
     )
-    metadata = Column(
+    metadata_json = Column(
         JSON,
         nullable=True,
         comment="Дополнительная информация (автор, год, глава в источнике и т.д.)",
@@ -231,6 +231,5 @@ class StudentProgress(Base, TimestampMixin):
         return f"<StudentProgress(student_id={self.student_id}, topic_id='{self.topic_id}', status='{self.status}')>"
 
 
-# Существующие индексы, если они все еще актуальны или нужно адаптировать
 Index("idx_document_status_uploaded_by", Document.status, Document.uploaded_by_tg_id)
 Index("idx_student_is_admin", Student.is_admin)  # Изменено на Student.is_admin

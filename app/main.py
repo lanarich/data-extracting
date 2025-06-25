@@ -11,29 +11,26 @@ from aiogram.types import BotCommand, BotCommandScopeAllPrivateChats
 from handlers.admin import admin_router
 from handlers.user import user_router
 from hydra import compose, initialize
-
-# Импорт для Langchain LLM
-from langchain_openai import ChatOpenAI  # Добавлено
+from langchain_openai import ChatOpenAI
 from langfuse import Langfuse
 from langfuse.callback import CallbackHandler as LangfuseCallbackHandler
-from langgraph.graph import StatefulGraph  # Добавлено для типизации
-from lightrag import LightRAG  # Добавлено для типизации rag_instance
+from langgraph.graph import StatefulGraph
+from lightrag import LightRAG
 from loguru import logger
-from omegaconf import DictConfig  # Добавлено для типизации cfg
+from omegaconf import DictConfig
 from services.db_service import (
     create_db_engine_and_session_pool,
     create_tables,
     get_db_url,
 )
-from services.rag_service import initialize_lightrag_instance  # LightRAG все еще нужен
+from services.rag_service import initialize_lightrag_instance
 from utils.config_loader import load_texts_from_config
 
-# Импорт для создания графа
-from app.agents.graph import create_tutor_graph  # Добавлено
+from app.agents.graph import create_tutor_graph
 
 langfuse_callback_handler: Optional[LangfuseCallbackHandler] = None
 langfuse_client: Optional[Langfuse] = None
-cfg: Optional[DictConfig] = None  # Объявляем cfg глобально для доступа в finally
+cfg: Optional[DictConfig] = None
 
 try:
     with initialize(
@@ -44,7 +41,6 @@ try:
 
     if not hasattr(cfg, "server") or not cfg.server.API_KEY:
         raise ValueError("Отсутствует API_KEY в конфигурации (server.API_KEY).")
-    # ... (остальные проверки конфигурации как были) ...
     if not hasattr(cfg, "llm") or not cfg.llm.api_base or not cfg.llm.model_name:
         raise ValueError(
             "Отсутствует или неполная конфигурация LLM (llm.api_base, llm.model_name)."
@@ -105,7 +101,7 @@ logger.add(
     else "INFO",
     colorize=True,
 )
-# ... (остальная настройка логгера как была) ...
+
 if (
     hasattr(cfg, "logging")
     and hasattr(cfg.logging, "file_path")
@@ -170,16 +166,13 @@ else:
 
 
 async def set_bot_commands(bot: Bot):
-    # ... (код как был) ...
     user_commands = [
         BotCommand(command="start", description="▶️ Запустить / Перезапустить бота"),
         BotCommand(
             command="toggle_mode",
-            description="⚙️ Сменить режим LLM (Стандарт/Размышление)",  # Эта команда может потребовать переосмысления
+            description="⚙️ Сменить режим LLM (Стандарт/Размышление)",
         ),
-        BotCommand(
-            command="clear_history", description="🗑️ Очистить историю диалога"
-        ),  # Управление историей теперь в графе
+        BotCommand(command="clear_history", description="🗑️ Очистить историю диалога"),
     ]
     try:
         await bot.set_my_commands(
@@ -227,20 +220,15 @@ async def main():
         logger.critical(f"Не удалось инициализировать БД: {e}", exc_info=True)
         return
 
-    # Инициализация LLM для агентов LangGraph
-    # Используем конфигурацию из cfg.llm, но модель будет DeepSeek
     langchain_llm = ChatOpenAI(
-        model=cfg.llm.model_name,  # Должно быть "deepseek-ai/DeepSeek-R1-0528-Qwen3-8B"
+        model=cfg.llm.model_name,
         openai_api_base=cfg.llm.api_base,
-        openai_api_key=cfg.llm.api_key,  # Обычно "NO" для локального SGLang
+        openai_api_key=cfg.llm.api_key,
         temperature=cfg.llm.get("default_temperature", 0.7),
         max_tokens=cfg.llm.get("default_max_tokens", 2048),
-        # streaming=True, # Если планируется потоковая передача
-        # callbacks=[langfuse_callback_handler] if cfg.langfuse.enabled and langfuse_callback_handler else None # Добавляем Langfuse callback
     )
     logger.info(f"Langchain LLM ({cfg.llm.model_name}) инициализирован для агентов.")
 
-    # Инициализация LightRAG (остается как есть для RetrieverTool)
     rag_instance: Optional[LightRAG] = None
     try:
         logger.info("Инициализация LightRAG...")
@@ -255,7 +243,7 @@ async def main():
             await engine.dispose()
         return
 
-    if not rag_instance:  # Дополнительная проверка
+    if not rag_instance:
         logger.critical("Экземпляр rag_instance не был создан. Завершение работы.")
         if engine:
             await engine.dispose()
@@ -337,10 +325,3 @@ if __name__ == "__main__":
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
         logger.info("Бот остановлен вручную (KeyboardInterrupt или SystemExit).")
-    # except Exception as e: # Убрана общая обработка, чтобы видеть ошибки Hydra при запуске
-    #     print(f"КРИТИЧЕСКАЯ ОШИБКА (во время запуска/остановки): {e}", file=sys.stderr)
-    #     logger.critical(
-    #         f"Критическая ошибка во время запуска или глобальной остановки бота: {e}",
-    #         exc_info=True,
-    #     )
-    #     sys.exit(1)

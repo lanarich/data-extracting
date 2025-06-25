@@ -21,6 +21,8 @@ langgraph = "^0.4.8"
 langchain-openai = "^0.3.19"
 langchain-community = "^0.3.24"
 langfuse = "^2.60.8"
+pyppeteer = "^2.0.0"
+grandalf = "^0.8"
 
 [tool.poetry.group.dev.dependencies]
 pre-commit = "4.2.0"

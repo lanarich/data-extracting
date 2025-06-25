@@ -1,42 +1,50 @@
-from typing import Dict, List, Optional
+from typing import Annotated, Dict, List, Optional
 
 from langchain_core.messages import BaseMessage
-
-# Если у вас есть модели Pydantic для Student, CurriculumTopic, StudentProgress,
-# их можно импортировать и использовать здесь для более строгой типизации.
-# from app.models.models import Student, CurriculumTopic # Пример
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict
 
 
-class TutorGraphState(Dict):
+class TutorGraphState(TypedDict):
     """
     Состояние для графа ИИ Тьютора.
-    Использует Dict для гибкости, но можно заменить на TypedDict или Pydantic модель.
+    Использует TypedDict для строгой типизации и совместимости с LangGraph.
     """
 
+    # Основная информация о студенте
     student_id: int
-    student_profile: Optional[Dict]  # Или Optional[Student]
-    input_query: Optional[str]
-    chat_history: List[
-        BaseMessage
-    ]  # Или List[Dict[str, str]] если используете простой формат
+    student_profile: Optional[Dict]
 
+    # История сообщений с автоматическим добавлением
+    chat_history: Annotated[List[BaseMessage], add_messages]
+
+    # Пользовательский ввод
+    input_query: Optional[str]
+
+    # Информация о текущей теме
     current_topic_id: Optional[str]
     current_topic_name: Optional[str]
     current_learning_objectives: Optional[str]
-    # current_topic_details: Optional[CurriculumTopic] # Пример
 
+    # Извлеченный контекст
     retrieved_context: Optional[List[str]]
+    retrieval_query: Optional[str]  # Для отладки
+    retrieval_source: Optional[str]  # Источник запроса
+
+    # Оценка знаний
     assessment_question: Optional[str]
     student_answer: Optional[str]
-    assessment_feedback: Optional[str]  # Оценка ответа студента
+    assessment_feedback: Optional[str]
+    assessment_results: Optional[Dict]
 
-    recommendations: Optional[List[str]]  # Список рекомендаций
+    # Рекомендации
+    recommendations: Optional[List[str]]
 
-    error_message: Optional[str]  # Для отлова и передачи ошибок между узлами
+    # Обработка ошибок
+    error_message: Optional[str]
+    user_message: Optional[str]  # Пользовательское сообщение об ошибке
+    error_handled: Optional[bool]
 
-    # Можно добавить другие поля по мере необходимости
-    # Например, для хранения промежуточных результатов или флагов
-    next_node_to_call: Optional[str]  # Для условных переходов, если понадобится
-
-    # Langfuse trace object, если нужно передавать его явно
-    # langfuse_trace: Optional[Any] # Тип зависит от объекта трейса Langfuse
+    # Дополнительные поля для управления потоком
+    next_node_to_call: Optional[str]
+    retrieval_top_k: Optional[int]
