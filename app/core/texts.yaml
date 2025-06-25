@@ -16,6 +16,13 @@ rag:
 user_commands:
   chat_history_cleared: "История вашей переписки со мной была очищена."
 
+registration:
+  ask_full_name: "Пожалуйста, укажите ваше полное имя."
+  ask_direction: "Укажите направление обучения."
+  ask_program: "Укажите образовательную программу."
+  ask_course: "На каком курсе вы обучаетесь?"
+  registration_complete: "Спасибо! Регистрация завершена."
+
 admin:
   admin_welcome: "Добро пожаловать, Администратор! Ваша панель управления:"
   admin_docs_list_empty: "Список загруженных документов пуст."

@@ -84,6 +84,10 @@ async def get_or_create_student(
     username: Optional[str] = None,
     first_name: Optional[str] = None,
     last_name: Optional[str] = None,
+    middle_name: Optional[str] = None,
+    full_name: Optional[str] = None,
+    program: Optional[str] = None,
+    direction: Optional[str] = None,
     course: Optional[int] = None,
     group: Optional[str] = None,
     specialization: Optional[str] = None,
@@ -100,6 +104,10 @@ async def get_or_create_student(
                 username=username,
                 first_name=first_name,
                 last_name=last_name,
+                middle_name=middle_name,
+                full_name=full_name,
+                program=program,
+                direction=direction,
                 course=course,
                 group=group,
                 specialization=specialization,
@@ -120,6 +128,18 @@ async def get_or_create_student(
                 updated_fields = True
             if last_name is not None and student.last_name != last_name:
                 student.last_name = last_name
+                updated_fields = True
+            if middle_name is not None and student.middle_name != middle_name:
+                student.middle_name = middle_name
+                updated_fields = True
+            if full_name is not None and student.full_name != full_name:
+                student.full_name = full_name
+                updated_fields = True
+            if program is not None and student.program != program:
+                student.program = program
+                updated_fields = True
+            if direction is not None and student.direction != direction:
+                student.direction = direction
                 updated_fields = True
             if course is not None and student.course != course:
                 student.course = course
@@ -455,10 +475,16 @@ async def get_student_progress_summary_for_recommendations_agent(
     summary_parts.append(
         f"Студент: {student.first_name or student.username or student.user_id}."
     )
+    if student.full_name:
+        summary_parts.append(f"Полное имя: {student.full_name}.")
     if student.course:
         summary_parts.append(f"Курс: {student.course}.")
     if student.group:
         summary_parts.append(f"Группа: {student.group}.")
+    if student.program:
+        summary_parts.append(f"Программа: {student.program}.")
+    if student.direction:
+        summary_parts.append(f"Направление: {student.direction}.")
 
     if current_topic_id:
         topic = await get_curriculum_topic_by_id(session, current_topic_id)
