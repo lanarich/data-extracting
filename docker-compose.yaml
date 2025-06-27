@@ -9,7 +9,7 @@ services:
     network_mode: host 
     shm_size: 16g
     environment:
-      HF_TOKEN: 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
+      HF_TOKEN: "введите ваш токен"
       TORCHINDUCTOR_CACHE_DIR: /root/.cache/torch_compile 
     entrypoint: python3 -m sglang.launch_server
     command: >
