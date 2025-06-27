@@ -111,7 +111,7 @@ async def handle_upload_document_action(
     upload_prompt_key = "admin_doc_upload_prompt"
     prompt_text = bot_texts.get("admin", {}).get(
         upload_prompt_key,
-        "Пожалуйста, отправьте файл документа для загрузки (например, .txt, .pdf, .docx).",
+        "Пожалуйста, отправьте файл документа для загрузки, формат .pdf",
     )
 
     await callback.message.edit_text(prompt_text)
